@@ -168,6 +168,7 @@ local initialScanDone = false
 local savedGlobalShadows = true
 local errorCount = 0
 local rebuildRequested = false
+local refreshSoon = false      -- a new map chunk appeared: activate it next frame
 
 local stats = {parts = 0, records = 0, pages = 0, wedges = 0, meshLoads = 0, frameMs = 0}
 
@@ -1051,12 +1052,14 @@ do
 	end
 
 	-- True (and remembers the part) while a mesh is still loading.
+	-- Remembers the part so it updates when the mesh arrives. Only the first load attempt makes
+	-- the part wait (no shadow); while a failed load is retried it keeps its fallback shadow.
 	function waitForMesh(entry, state)
 		local s = entry.status
-		if s == "queued" or s == "loading" or s == "new" then
+		if s == "queued" or s == "loading" or s == "new" or s == "failed" then
 			entry.users = entry.users or setmetatable({}, {__mode = "k"})
 			entry.users[state] = true
-			return true
+			return entry.fails == 0 and s ~= "failed"
 		end
 		return false
 	end
@@ -1158,7 +1161,8 @@ do
 
 	local function meshPartShape(state, part, size)
 		local content = part.MeshContent
-		local entry = MeshData.get(content)
+		-- avatar meshes almost never allow reading, so characters go straight to ray sampling
+		local entry = not state.character and MeshData.get(content) or nil
 		if entry then
 			if entry.status == "ready" then
 				return Shapes.fromMesh(entry, size, ZERO)
@@ -1199,7 +1203,7 @@ do
 		if mesh:IsA("SpecialMesh") then
 			local meshType = mesh.MeshType
 			if meshType == Enum.MeshType.FileMesh then
-				local entry = MeshData.get(mesh.MeshContent)
+				local entry = not state.character and MeshData.get(mesh.MeshContent) or nil
 				if entry then
 					if entry.status == "ready" then
 						return Shapes.fromMesh(entry, entry.size * scale, entry.center * scale + offset)
@@ -2918,14 +2922,24 @@ do
 		local ch = chunks[key]
 		if not ch then
 			ch = {key = key, center = V3((ix + 0.5) * size, (iy + 0.5) * size, (iz + 0.5) * size), list = {},
-				active = false, lod = 0, needsScan = true, cursor = 1, rescan = false, dist = 0}
+				active = false, lod = 0, needsScan = true, cursor = 1, rescan = false, dist = 0, reach = size * 0.87}
 			chunks[key] = ch
+			refreshSoon = true
+		end
+		-- big parts reach far outside their chunk: keep the chunk loaded while any of it is near
+		local reach = (pos - ch.center).Magnitude + state.part.Size.Magnitude * 0.5
+		if reach > ch.reach then
+			ch.reach = reach
 		end
 		local list = ch.list
 		list[#list + 1] = state
 		state.chunk = ch
 		state.chunkIndex = #list
-		markDirty(state)
+		if initialScanDone then
+			markUrgent(state) -- a part that just appeared or came to rest: shadow right away
+		else
+			markDirty(state) -- first load goes chunk by chunk, nearest first
+		end
 	end
 
 	removeFromChunk = function(state)
@@ -2939,6 +2953,9 @@ do
 		list[i] = last
 		last.chunkIndex = i
 		list[#list] = nil
+		if i < ch.cursor then
+			ch.rescan = true -- an unscanned part moved behind the scan cursor
+		end
 		state.chunk = nil
 		state.chunkIndex = nil
 		if state.casterRec and state.casterRec.pool == "static" then
@@ -3357,6 +3374,7 @@ do
 					st.shapeVersion += 1
 					st.castShadow = part.CastShadow
 					evaluate(st)
+					info.dirty = true
 				end
 			end
 		end
@@ -3391,10 +3409,9 @@ do
 
 	local function refreshChunks(camPos)
 		local R = CONFIG.ShadowDistance
-		local reach = CONFIG.ChunkSize * 0.87
 		local queue = {}
 		for _, ch in pairs(chunks) do
-			local d = max(0, (ch.center - camPos).Magnitude - reach)
+			local d = max(0, (ch.center - camPos).Magnitude - ch.reach)
 			ch.dist = d
 			if d <= R then
 				if not ch.active then
@@ -3499,7 +3516,24 @@ do
 		end
 	end
 
-	local CHAR_LIST, MOVE_LIST, SINGLE = {}, {}, {}
+	local CHAR_LIST, MOVE_LIST = {}, {}
+	local movingGroups = {}            -- assembly root / model -> group of moving parts
+	local MAX_RECEIVER_GROUP = 40      -- bigger moving groups only cast (receiving would cost too much)
+
+	local function groupKeyOf(st)
+		local part = st.part
+		if not part.Anchored then
+			local root = part.AssemblyRootPart
+			if root then
+				return root
+			end
+		end
+		local parent = part.Parent
+		if parent and parent ~= Workspace and parent.ClassName == "Model" then
+			return parent
+		end
+		return part
+	end
 
 	local function distLess(x, y)
 		return x.sortDist < y.sortDist
@@ -3512,6 +3546,29 @@ do
 		end
 		local first = info.members[1]
 		return first and first.part
+	end
+
+	-- True when any body part moved (or parts were added / removed) since the last check.
+	local function characterMoved(info)
+		local last = info.lastCFs
+		if not last then
+			last = {}
+			info.lastCFs = last
+		end
+		local members = info.members
+		local moved = info.dirty or info.memberCount ~= #members
+		info.dirty = false
+		info.memberCount = #members
+		for i = 1, #members do
+			local st = members[i]
+			local cf = st.part.CFrame
+			local prev = last[st]
+			if not prev or not cf:FuzzyEq(prev, 1e-4) then
+				last[st] = cf
+				moved = true
+			end
+		end
+		return moved
 	end
 
 	local function processDynamic(camPos, now, deadline)
@@ -3538,9 +3595,12 @@ do
 			local info = CHAR_LIST[i]
 			local lod = info.dist < CONFIG.NearDetail and 1 or 2
 			local inBudget = i == 1 or clock() < deadline
+			-- a character standing perfectly still keeps its shadows (animated ones always move)
+			local moved = characterMoved(info)
 			if CONFIG.CharacterShadows and casting < CONFIG.MaxCharacters and info.dist <= CONFIG.DynamicDistance then
 				casting += 1
-				if inBudget then
+				local rec = info.casterRec
+				if inBudget and (moved or not rec or rec.lightVersion ~= Light.version or rec.lod ~= lod) then
 					safeCall(buildDynamicCaster, info, info.members, lod)
 				end
 			elseif info.casterRec then
@@ -3549,65 +3609,90 @@ do
 			end
 			if receiving < CONFIG.MaxCharacterReceivers and info.dist <= CONFIG.ReceiverDistance then
 				receiving += 1
-				if inBudget then
+				local rec = info.recvRec
+				if inBudget and (moved or not rec or rec.lightVersion ~= Light.version or now - (rec.builtAt or 0) > 0.2) then
 					safeCall(buildReceiverRecord, info, info.members, lod)
+					if info.recvRec then
+						info.recvRec.builtAt = now
+					end
 				end
 			elseif info.recvRec then
 				dropRecord(info.recvRec)
 				info.recvRec = nil
 			end
 		end
-		-- moving parts
-		local nm = 0
+		-- moving parts, grouped by assembly: a whole car (or a tweened door model) is one job
+		for _, grp in pairs(movingGroups) do
+			grp.n, grp.sig, grp.ids = 0, 0, 0
+		end
 		for st in pairs(dynamicStates) do
 			if not st.dead then
-				st.sortDist = (st.part.Position - camPos).Magnitude
-				nm += 1
-				MOVE_LIST[nm] = st
+				local key = groupKeyOf(st)
+				local grp = movingGroups[key]
+				if not grp then
+					grp = {members = {}, n = 0, sig = 0, ids = 0, builtSig = -1, builtIds = -1, recvSig = -1, recvIds = -1}
+					movingGroups[key] = grp
+				end
+				local n = grp.n + 1
+				grp.n = n
+				grp.members[n] = st
+				grp.sig += st.cfVersion
+				grp.ids += st.id
 			end
 		end
-		for i = #MOVE_LIST, nm + 1, -1 do
+		local ng = 0
+		for key, grp in pairs(movingGroups) do
+			local members = grp.members
+			for i = #members, grp.n + 1, -1 do
+				members[i] = nil
+			end
+			if grp.n == 0 then
+				dropRecord(grp.casterRec)
+				dropRecord(grp.recvRec)
+				movingGroups[key] = nil
+			else
+				grp.sortDist = (members[1].part.Position - camPos).Magnitude
+				ng += 1
+				MOVE_LIST[ng] = grp
+			end
+		end
+		for i = #MOVE_LIST, ng + 1, -1 do
 			MOVE_LIST[i] = nil
 		end
-		if nm > 1 then
+		if ng > 1 then
 			tsort(MOVE_LIST, distLess)
 		end
 		local moving, loose = 0, 0
-		for i = 1, nm do
-			local st = MOVE_LIST[i]
-			local d = st.sortDist
+		for i = 1, ng do
+			local grp = MOVE_LIST[i]
+			local d = grp.sortDist
 			local lod = d < CONFIG.NearDetail and 1 or (d < CONFIG.MidDetail and 2 or 3)
-			if st.isCaster and moving < CONFIG.MaxMovingShadows and d <= CONFIG.DynamicDistance then
+			if moving < CONFIG.MaxMovingShadows and d <= CONFIG.DynamicDistance then
 				moving += 1
-				local rec = st.casterRec
-				if (not rec or rec.cfVersion ~= st.cfVersion or rec.lightVersion ~= Light.version or rec.lod ~= lod)
-					and clock() < deadline then
-					SINGLE[1] = st
-					safeCall(buildDynamicCaster, st, SINGLE, lod)
-					SINGLE[1] = nil
-					if st.casterRec then
-						st.casterRec.cfVersion = st.cfVersion
-					end
+				local rec = grp.casterRec
+				local changed = grp.sig ~= grp.builtSig or grp.ids ~= grp.builtIds
+				if (changed or not rec or rec.lightVersion ~= Light.version or rec.lod ~= lod) and clock() < deadline then
+					safeCall(buildDynamicCaster, grp, grp.members, lod)
+					grp.builtSig, grp.builtIds = grp.sig, grp.ids
 				end
-			elseif st.casterRec then
-				dropRecord(st.casterRec)
-				st.casterRec = nil
+			elseif grp.casterRec then
+				dropRecord(grp.casterRec)
+				grp.casterRec = nil
 			end
-			if st.isReceiver and loose < CONFIG.MaxLooseReceivers and d <= CONFIG.ReceiverDistance then
+			if loose < CONFIG.MaxLooseReceivers and d <= CONFIG.ReceiverDistance and grp.n <= MAX_RECEIVER_GROUP then
 				loose += 1
-				local rec = st.recvRec
-				if (not rec or rec.cfVersion ~= st.cfVersion or now - (rec.builtAt or 0) > 0.15) and clock() < deadline then
-					SINGLE[1] = st
-					safeCall(buildReceiverRecord, st, SINGLE, lod)
-					SINGLE[1] = nil
-					if st.recvRec then
-						st.recvRec.cfVersion = st.cfVersion
-						st.recvRec.builtAt = now
+				local rec = grp.recvRec
+				local changed = grp.sig ~= grp.recvSig or grp.ids ~= grp.recvIds
+				if (changed or not rec or now - (rec.builtAt or 0) > 0.15) and clock() < deadline then
+					safeCall(buildReceiverRecord, grp, grp.members, lod)
+					grp.recvSig, grp.recvIds = grp.sig, grp.ids
+					if grp.recvRec then
+						grp.recvRec.builtAt = now
 					end
 				end
-			elseif st.recvRec then
-				dropRecord(st.recvRec)
-				st.recvRec = nil
+			elseif grp.recvRec then
+				dropRecord(grp.recvRec)
+				grp.recvRec = nil
 			end
 		end
 	end
@@ -3661,7 +3746,8 @@ do
 			lastCharacterRefresh = now
 			refreshCharacters()
 		end
-		if now - lastRefresh > 0.25 then
+		if refreshSoon or now - lastRefresh > 0.25 then
+			refreshSoon = false
 			lastRefresh = now
 			refreshChunks(camPos)
 		end
