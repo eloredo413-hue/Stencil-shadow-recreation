@@ -32,8 +32,9 @@ There are two scripts. They are the same script with one setting changed:
   facets, so a tree top's dark side ended in steps, facet by facet. Here every one of those classic
   facets is dark or lit as a whole.
   - The steps are drawn on finer facets that hug the real ball, so nothing floats off its edge.
-  - With EditableMesh, the middle of a ball's dark side is one ball-shaped part. With parts, a
-    nearby tree top costs about 250 to 400 parts.
+  - In the Highlight style, the middle of a ball's dark side is one ball-shaped part. When drawing
+    with parts, a nearby size-8 tree top costs about 300 parts in the Highlight style and about
+    750 in the Direct style (where that ball-shaped part would overlap the facets).
   - A ball's shadow on the ground has the classic facets' outline.
   - `RoundShading = "Smooth"` gives the smooth version instead.
 - **Characters cast their exact silhouette**, R6 and R15, with packages, hats, hair and tools.
@@ -188,8 +189,8 @@ What that means inside a building:
 - **Direct style.**
   - Shadows on terrain, and shadows from several parts landing on a character, can still overlap
     and look darker there.
-  - Balls cost more parts than with the Highlight style, because the ball-shaped middle would
-    overlap the facets.
+  - Balls cost more parts than with the Highlight style (about 750 instead of 300 for a nearby
+    tree top drawn with parts), because the ball-shaped middle would overlap the facets.
   - Building takes about twice the CPU time, because overlaps are cut on the CPU.
 - **Highlight style.** Roblox draws at most 31 Highlights at once, and draws them without
   anti-aliasing ([DevForum feature request](https://devforum.roblox.com/t/anti-aliasing-for-highlight-instances/1862811)).
