@@ -23,15 +23,19 @@ Script: [`src/StencilShadows.client.luau`](src/StencilShadows.client.luau)
   - Mesh shadows use the real triangles when the mesh can be read, so concave shapes such as arches
     and L-shapes keep their holes.
   - If a mesh can't be read, its outline is sampled with raycasts instead.
-- **Characters cast their real shape**, R6 and R15, with packages, hats, hair and tools.
-  - Avatar meshes are read when the game allows it, or sampled with raycasts when the avatar has
-    real collision shapes.
-  - Most games give avatars only box collisions and don't let meshes be read. Then each body part
-    becomes a block with rounded edges that fills the part's real size. The shadow keeps the
-    avatar's build instead of becoming boxes or a stick figure.
+- **Characters cast their real silhouette**, R6 and R15, with packages, hats, hair and tools.
+  - Most games don't let scripts read avatar meshes, and give avatars plain box collisions. But any
+    script may create a copy of a mesh with an exact convex-hull collision shape. The script makes
+    one hidden copy per mesh, outlines it with raycasts, and casts each body part's real outline.
+  - Until an outline has loaded (a second or two after an avatar appears), or if it can't be
+    loaded, a part casts a rounded block of its real size.
   - Default blocky bodies (R6, and R15 with the default body) are real boxes and are drawn exactly.
-  - Nothing is drawn on an avatar part whose exact shape isn't known, so no dark cubes stick out
-    of the player.
+- **Shadows land on players too.**
+  - Blocky bodies take exact shadows, cut where a shadow's edge crosses them, and their sides away
+    from the sun are dark. These sit 0.012 studs off the body, so they don't look oversized.
+  - On package avatars, a body part inside a shadow gets a slightly larger invisible copy in the
+    shadow model, so the same Highlight darkens exactly that part's real shape.
+  - Nothing that doesn't match the avatar's real shape is drawn on it, so no dark cubes stick out.
   - Zoomed into first person, your own character's shadows disappear along with it, as they do
     with Roblox's shadows.
 - **Shadows land on everything behind the caster.**
@@ -74,11 +78,14 @@ Everything is in the `CONFIG` table at the top of the script. The most useful se
 | `ShadeBackFaces` | `true` | Darken the sides of parts that face away from the sun. |
 | `CurvedShading` | `"Auto"` | Smooth dark sides on round parts. `"Auto"` does all round parts with EditableMesh, and only cylinders when drawing with parts, because balls would need too many parts. |
 | `GlowingPartsStayLit` | `true` | Neon parts are never darkened. |
+| `AvatarOutlines` | `true` | Cast avatars' real outlines, using hidden hull copies of their meshes. |
+| `ShadowsOnAvatars` | `true` | Darken package avatars' body parts when they stand in a shadow. |
+| `CharacterSurfaceOffset` | `0.012` | How far shadows float off characters (the map uses `SurfaceOffset`, 0.04). |
 | `LoadPause` | `true` | Freeze briefly at the start so all nearby shadows appear at once (no loading screen). |
 | `LoadPauseMax` | `5` | The longest the start-up pause may last, in seconds. |
 | `TransparentShadows` | `false` | See-through parts cast lighter shadows tinted with their color. |
 | `MinShadowElevation` | `8` | A sun lower than this many degrees is raised, so shadows don't stretch forever. |
-| `MaxShadowLength` | `200` | How far past its caster a shadow can reach. |
+| `MaxShadowLength` | `600` | How far past its caster a shadow can reach. |
 | `RenderStyle` | `"Highlight"` | `"Direct"` draws plain see-through black instead. Overlaps then stack, but it doesn't need a Highlight slot. |
 | `Backend` | `"Auto"` | `"EditableMesh"`, `"Parts"`, or automatic. |
 | `FrameBudget` | `4.2` | Milliseconds of shadow work per frame. |
@@ -153,11 +160,12 @@ What that means inside a building:
   - MeshParts only receive shadows on their own surface when their mesh can be read and is small
     enough (`MeshReceiverTriangles`).
   - Otherwise, flat meshes and unions use their bounding box.
-  - Package avatar parts don't take shadows or get dark sides unless their exact shape is known.
-    Blocky bodies and the classic head do.
-- **Avatar shapes.** Most games don't let scripts read avatar meshes and give avatars box
-  collisions, so package avatars cast rounded blocks of each part's real size. That's close, but
-  not the exact mesh outline.
+- **Avatars.**
+  - Each body part's outline is convex, so a gap inside one part (between fingers, say) is filled
+    in. Gaps between parts, like between the legs, show.
+  - On package avatars a body part darkens as a whole when it's mostly in shadow. A shadow edge
+    can't cut across the part, and its side away from the sun isn't darkened separately.
+  - Layered clothing isn't darkened.
 - **Jagged edges on phones.** Roblox draws Highlights without anti-aliasing, so shadow edges look a
   little pixelated, mostly on mobile
   ([DevForum feature request](https://devforum.roblox.com/t/anti-aliasing-for-highlight-instances/1862811)).
@@ -175,10 +183,11 @@ What that means inside a building:
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 37 scenarios compare the shadow triangles it draws against independently computed projections.
+The 43 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover every shape, clipping, sunk casters, moving and resting parts, vehicles, removal,
 characters (R6, R15, packages, blocky bodies, the classic head, first person), the toggle key, the
 wedge-part fallback, exact concave meshes, ray-sampled meshes, terrain, sun, moon and night,
 oversized shadows split across pages, tight time budgets, streaming, EditableMesh memory running
 out, failed mesh loads, edges meeting without gaps, round parts without gaps or floating, Neon
-parts, and the start-up pause.
+parts, the start-up pause, avatar outlines from hull copies, package avatars darkening in shadow,
+tight shading on blocky players, shadows falling 450 studs, and parts sunk into the floor.

@@ -24,8 +24,10 @@
 	   they move. Shadows also land on players and loose parts, drape over terrain, and the sides
 	   of parts that face away from the light are darkened as if they were inside the old shadow
 	   volumes (on round parts, exactly where the curve turns away).
-	 * Characters cast their real shape when it can be read; otherwise each body part becomes a
-	   rounded block of its real size. In first person your own shadows go away with your body.
+	 * Characters cast their real silhouette: each avatar mesh is outlined once through a hidden
+	   copy with an exact hull collision shape. Package avatars darken in shadow through slightly
+	   larger invisible copies under the same Highlight. In first person your own shadows go away
+	   with your body.
 	 * Shadows follow the sun, and the moon at night.
 
 	 Other scripts can use _G.StencilShadows:  SetEnabled(bool), Toggle(), IsEnabled(),
@@ -45,6 +47,7 @@ local CONFIG = {
 	                                      -- "Direct":    plain see-through black geometry
 	DirectTransparency = 0.62,            -- part transparency used by the "Direct" style
 	SurfaceOffset = 0.04,                 -- how far shadows float off a surface (stops z-fighting)
+	CharacterSurfaceOffset = 0.012,       -- the same on characters (seen up close: kept tight)
 	ShadeBackFaces = true,                -- sides facing away from the light are shadowed too
 	CurvedShading = "Auto",               -- dark sides of balls / cylinders follow the real curve:
 	                                      -- "Auto" = all round parts with EditableMesh, only
@@ -64,7 +67,7 @@ local CONFIG = {
 	MinLightElevation = 1.5,              -- degrees; sun AND moon lower than this = no shadows
 	MinShadowElevation = 8,               -- degrees; a lower light is raised to this angle
 	LightUpdateAngle = 0.6,               -- degrees the light must move before map shadows rebuild
-	MaxShadowLength = 200,                -- studs a shadow can reach past its caster
+	MaxShadowLength = 600,                -- studs a shadow can reach past its caster
 
 	-- Range & detail ----------------------------------------------------------------------------
 	ShadowDistance = 520,                 -- map shadows are kept within this distance of the camera
@@ -87,6 +90,8 @@ local CONFIG = {
 	TerrainShadows = true,
 	CharacterShadows = true,
 	AccessoryShadows = true,
+	AvatarOutlines = true,                -- real avatar outlines from hidden hull copies of their meshes
+	ShadowsOnAvatars = true,              -- package avatars darken in shadow (real mesh shape)
 	IgnoreAttribute = "NoStencilShadow",  -- set this attribute to true on a part / model to skip it
 
 	-- Moving things -----------------------------------------------------------------------------
@@ -136,6 +141,7 @@ local tsort, tremove, tcreate = table.sort, table.remove, table.create
 
 local CONTAINER_NAME = "__StencilShadows"
 local TINT_CONTAINER_NAME = "__StencilShadowsTinted"
+local PROBE_NAME = "__StencilShadowsProbe"
 local SAVED_SHADOWS_ATTR = "StencilShadowsSavedGlobalShadows"
 
 local CONTACT = 0.01       -- studs; caster points this close to a surface count as touching it
@@ -168,7 +174,8 @@ do
 	end
 	for _, child in ipairs(Workspace:GetChildren()) do
 		local name = child.Name
-		if name == CONTAINER_NAME or name == TINT_CONTAINER_NAME or name == "__StencilShadowReceivers" then
+		if name == CONTAINER_NAME or name == TINT_CONTAINER_NAME or name == PROBE_NAME
+			or name == "__StencilShadowReceivers" then
 			pcall(child.Destroy, child)
 		end
 	end
@@ -208,10 +215,10 @@ local getShape, onShapeChanged, onPartChanged
 local markDirty, markDependentsDirty, addToChunk, removeFromChunk, queueUpstream
 local convexHull, clipLine, clipByLines, polyArea, reversePoly, edgeLines, setLine
 local updateLight, supportPoints, waitForMesh, getGeom, getWorldFaces
-local resetOut, emitFace, emitWorld, lightOverlap, castOnFace, drapeOnTerrain
+local resetOut, emitFace, emitWorld, lightOverlap, castOnFace, drapeOnTerrain, grownFace
 local queryBox, dropRecord, buildStaticCaster, buildDynamicCaster, buildReceiverRecord, safeCall
 local register, unregister, processChanges, processRemovals, processAdds, processCharacterChanges
-local processMeshReady, processUpstream, pollPhysics, refreshCharacters, step
+local processMeshReady, processProbeReady, processUpstream, pollPhysics, refreshCharacters, step
 
 ----------------------------------------------------------------------------------------------------
 -- Little helpers
@@ -272,13 +279,15 @@ end
 -- 2D polygon helpers (flat x / y arrays, counter-clockwise polygons)
 ----------------------------------------------------------------------------------------------------
 do
-	local hullKeyX, hullKeyY = nil, nil
+	-- points are sorted on coordinates rounded to 1e-5 studs, so points that land on (almost) the
+	-- same spot sit next to each other and are merged
+	local QX, QY = {}, {}
 	local function hullLess(i, j)
-		local a, b = hullKeyX[i], hullKeyX[j]
+		local a, b = QX[i], QX[j]
 		if a ~= b then
 			return a < b
 		end
-		return hullKeyY[i] < hullKeyY[j]
+		return QY[i] < QY[j]
 	end
 
 	local hullOrder = {}
@@ -297,8 +306,30 @@ do
 		for i = #order, n + 1, -1 do
 			order[i] = nil
 		end
-		hullKeyX, hullKeyY = px, py
+		for i = 1, n do
+			QX[i] = floor(px[i] * 1e5 + 0.5)
+			QY[i] = floor(py[i] * 1e5 + 0.5)
+		end
 		tsort(order, hullLess)
+		-- points that land on the same spot (the top and bottom of an upright prism seen from
+		-- straight above) would trip the chains below: keep one of each
+		local m, lx, ly = 0, nil, nil
+		for t = 1, n do
+			local i = order[t]
+			local x, y = QX[i], QY[i]
+			if x ~= lx or y ~= ly then
+				m += 1
+				order[m] = i
+				lx, ly = x, y
+			end
+		end
+		n = m
+		if n < 3 then
+			for i = 1, n do
+				out[i] = order[i]
+			end
+			return n
+		end
 		local k = 0
 		for t = 1, n do
 			local i = order[t]
@@ -582,17 +613,34 @@ do
 		if nLines < 3 then
 			return nil
 		end
-		-- e* = the outline grown past its edges (see growFace); the same as the outline until then
-		return {o = o, n = n, u = u, v = v, xs = xs, ys = ys, count = count, lines = lines, nLines = nLines,
-			elines = lines, exs = xs, eys = ys, ecount = count}
+		return {o = o, n = n, u = u, v = v, xs = xs, ys = ys, count = count, lines = lines, nLines = nLines}
 	end
 
-	-- Shadows float SurfaceOffset off a face. Where two faces meet at an edge, their lifted shadows
-	-- would leave a thin lit line along it, so each face's shadow area is grown past its edges until
-	-- it meets the neighbour's: by SurfaceOffset * tan(half the angle between the two faces' normals),
-	-- which is exactly SurfaceOffset at a right-angled edge. ks: that tangent per edge line (nil = 1).
+	-- Shadows float a little off a face (`lift`). Where two faces meet at an edge, their lifted
+	-- shadows would leave a thin lit line along it, so each face's shadow area is grown past its
+	-- edges until it meets the neighbour's: by lift * tan(half the angle between the two faces'
+	-- normals), which is exactly `lift` at a right-angled edge. ks: that tangent per edge line
+	-- (nil = 1 for every edge).
 	local function growFace(face, ks)
-		local lift = CONFIG.SurfaceOffset
+		face.ks = ks or false
+	end
+
+	-- The face's outline and edge lines grown for a lift (cached per lift: one shape can be shared
+	-- by a map part and a character part, which use different lifts).
+	grownFace = function(face, lift)
+		if face.ks == nil or lift <= 0 then
+			return face
+		end
+		local cache = face.grown
+		if not cache then
+			cache = {}
+			face.grown = cache
+		end
+		local g = cache[lift]
+		if g then
+			return g
+		end
+		local ks = face.ks
 		local lines, nLines = face.lines, face.nLines
 		local el = tcreate(nLines * 3)
 		for l = 0, nLines - 1 do
@@ -616,9 +664,12 @@ do
 			end
 		end
 		if m < 3 then
-			return
+			g = face
+		else
+			g = {lines = el, nLines = nLines, xs = exs, ys = eys, count = m}
 		end
-		face.elines, face.exs, face.eys, face.ecount = el, exs, eys, m
+		cache[lift] = g
+		return g
 	end
 
 	-- tan(half the angle) between each face and the face across each of its edges
@@ -927,7 +978,7 @@ do
 		end
 		-- lift 0: the facets already float just off the curve
 		return {o = o, n = nrm, u = u, v = v, xs = xs, ys = ys, count = count, lines = lines, nLines = nLines,
-			elines = lines, exs = xs, eys = ys, ecount = count, lift = 0, term = term}
+			lift = 0, term = term}
 	end
 
 	-- Facets of a surface of revolution around `axis` (e1, e2 complete the frame). rings:
@@ -1399,6 +1450,8 @@ do
 		MeshData.running = false
 	end
 
+	MeshData.keyOf = meshKey
+
 	function MeshData.get(content)
 		if not CONFIG.MeshShadows then
 			return nil
@@ -1528,6 +1581,153 @@ do
 end
 
 ----------------------------------------------------------------------------------------------------
+-- Avatar outlines. Games rarely let scripts read avatar meshes, and usually give avatars plain box
+-- collisions. But any script may create a MeshPart from a mesh with an exact convex-hull collision
+-- shape: raycasting such a hidden copy (once per mesh) gives the mesh's real outline.
+----------------------------------------------------------------------------------------------------
+local MeshProbe = {entries = {}, queue = newQueue(), first = newQueue(), ready = newQueue(), running = false,
+	busy = 0, model = nil}
+do
+	local probeParams = RaycastParams.new()
+	probeParams.FilterType = Enum.RaycastFilterType.Include
+	probeParams.IgnoreWater = true
+	local SPOT = CFrame.new(0, 4000, 0) -- far away from everything else
+
+	-- 6 sides, 12 edges, 8 corners: rays come at the copy from all of them
+	local DIRS = {}
+	for x = -1, 1 do
+		for y = -1, 1 do
+			for z = -1, 1 do
+				if x ~= 0 or y ~= 0 or z ~= 0 then
+					DIRS[#DIRS + 1] = V3(x, y, z).Unit
+				end
+			end
+		end
+	end
+
+	local function probeModel()
+		local m = MeshProbe.model
+		if m == nil or m.Parent == nil then
+			m = Instance.new("Model")
+			m.Name = PROBE_NAME
+			m.Parent = Workspace
+			MeshProbe.model = m
+		end
+		return m
+	end
+
+	-- Points on the copy's surface, normalized to -0.5..0.5 of its size.
+	local function sampleCopy(part)
+		local cf, size = part.CFrame, part.Size
+		probeParams.FilterDescendantsInstances = {part}
+		local R = size.Magnitude * 0.5 + 0.5
+		local pts = {}
+		local G = 7
+		local cast = 0
+		for _, d in ipairs(DIRS) do
+			local p = (abs(d.Y) < 0.9 and YAXIS or XAXIS):Cross(d).Unit
+			local q = d:Cross(p)
+			for i = 0, G - 1 do
+				local s = (i / (G - 1) * 2 - 1) * R
+				for j = 0, G - 1 do
+					local t = (j / (G - 1) * 2 - 1) * R
+					local o = d * (R + 1) + p * s + q * t
+					local hit = Workspace:Raycast(cf * o, cf:VectorToWorldSpace(d * -(2 * R + 2)), probeParams)
+					if hit then
+						local lp = cf:PointToObjectSpace(hit.Position)
+						pts[#pts + 1] = V3(lp.X / size.X, lp.Y / size.Y, lp.Z / size.Z)
+					end
+					cast += 1
+					if cast % 500 == 0 then
+						task.wait() -- spread over a few frames
+					end
+				end
+			end
+		end
+		if #pts < 4 then
+			return nil
+		end
+		return supportPoints(pts, true)
+	end
+
+	local function probe(entry)
+		local part = AssetService:CreateMeshPartAsync(entry.content, {
+			CollisionFidelity = Enum.CollisionFidelity.Hull,
+			RenderFidelity = Enum.RenderFidelity.Performance,
+		})
+		if not part then
+			error("no MeshPart returned", 0)
+		end
+		local ok, err = pcall(function()
+			part.Anchored = true
+			part.CanCollide = false
+			part.CanTouch = false
+			part.CanQuery = true
+			part.CastShadow = false
+			part.Transparency = 1
+			part.CFrame = SPOT
+			entry.size = part.Size
+			part.Parent = probeModel()
+			entry.pts = sampleCopy(part)
+		end)
+		pcall(part.Destroy, part)
+		if not ok then
+			error(err, 0)
+		end
+		if not entry.pts then
+			error("the copy had no collision shape", 0)
+		end
+	end
+
+	local function loader()
+		while alive do
+			-- your own character's meshes go first
+			local entry = qpop(MeshProbe.first) or qpop(MeshProbe.queue)
+			if not entry then
+				break
+			end
+			entry.status = "loading"
+			local ok = pcall(probe, entry)
+			entry.status = ok and "ready" or "dead"
+			MeshProbe.busy -= 1
+			qpush(MeshProbe.ready, entry)
+			task.wait()
+		end
+		MeshProbe.running = false
+	end
+
+	-- The outline entry for a mesh (nil when it can't be had); `state` is redrawn when it's done.
+	function MeshProbe.get(content, state)
+		if not CONFIG.AvatarOutlines then
+			return nil
+		end
+		local key = MeshData.keyOf(content)
+		if type(key) ~= "string" then
+			return nil
+		end
+		local entry = MeshProbe.entries[key]
+		if not entry then
+			entry = {key = key, content = content, status = "queued", users = setmetatable({}, {__mode = "k"})}
+			MeshProbe.entries[key] = entry
+			MeshProbe.busy += 1
+			local info = state and state.charInfo
+			qpush((info and info.isLocal) and MeshProbe.first or MeshProbe.queue, entry)
+			if not MeshProbe.running and alive then
+				MeshProbe.running = true
+				task.spawn(loader)
+			end
+		end
+		if state then
+			state.probe = entry
+			if entry.status ~= "ready" and entry.status ~= "dead" then
+				entry.users[state] = true
+			end
+		end
+		return entry
+	end
+end
+
+----------------------------------------------------------------------------------------------------
 -- Which shape a part has
 ----------------------------------------------------------------------------------------------------
 do
@@ -1577,15 +1777,18 @@ do
 		return (uri and uri ~= "") and (uri .. "|" .. tostring(part.CollisionFidelity)) or nil
 	end
 
-	-- A MeshPart of a character: body part, hat, hair or tool. Only outlines are used (no dark
-	-- sides drawn on the avatar), so nothing ever sticks out of it.
+	-- A MeshPart of a character: body part, hat, hair or tool. Its shadow is the real outline of
+	-- its mesh whenever that can be had; dark sides and shadows on it come from mesh copies (see
+	-- BodyShade), so nothing ever sticks out of the avatar.
 	local function avatarMeshShape(state, part, size, lod)
 		local name = part.Name
 		local info = state.charInfo
 		local field = DESC_FIELD[name]
 		if field and info and info.blocky and info.blocky[field] then
+			state.shadeKind = nil -- exact faces take shadows the normal way
 			return Shapes.box(size) -- the default blocky body: these parts really are boxes
 		end
+		state.shadeKind = (not state.accessory and part.Parent == state.character) and "mesh" or nil
 		local content = part.MeshContent
 		-- 1. the real mesh, when the game lets meshes be read
 		local entry = MeshData.allowed and MeshData.get(content) or nil
@@ -1593,10 +1796,15 @@ do
 			if entry.status == "ready" then
 				return Shapes.fromMeshHull(entry, size, ZERO)
 			end
-			waitForMesh(entry, state) -- redrawn when it arrives, with a stand-in until then
+			waitForMesh(entry, state) -- redrawn when it arrives
 		end
-		-- 2. the real collision shape, unless that's just a box (avatars usually only have boxes)
-		if CONFIG.RaySampleMeshes then
+		-- 2. a hidden copy of the mesh with an exact hull collision shape, raycast once per mesh
+		local probe = MeshProbe.get(content, state)
+		if probe and probe.status == "ready" then
+			return Shapes.fromPoints("h" .. probe.key, probe.pts, size, ZERO, false)
+		end
+		-- 3. the avatar's own collision shape, unless that's just a box (it usually is)
+		if CONFIG.RaySampleMeshes and (probe == nil or probe.status == "dead") then
 			local key = rayKey(part, content)
 			local pts, busy = RaySample.get(part, key)
 			if pts and not pts.boxy then
@@ -1605,7 +1813,7 @@ do
 				return nil, true
 			end
 		end
-		-- 3. a stand-in with the part's real size
+		-- 4. a stand-in with the part's real size (until the outline arrives, or if it never can)
 		if state.accessory then
 			return Shapes.solidEllipsoid(size * 0.47, lod)
 		end
@@ -1613,9 +1821,11 @@ do
 	end
 
 	-- Character Parts that aren't the plain blocks they look like: the classic head, and R6 limbs
-	-- covered by a package (CharacterMesh). nil = use the normal (exact) rules.
+	-- dressed in a package mesh (CharacterMesh). nil = use the normal (exact) rules.
 	local function avatarPartShape(state, part, size, lod)
 		local name = part.Name
+		state.charMesh = nil
+		state.shadeKind = nil
 		if name == "Head" then
 			local mesh = part:FindFirstChildWhichIsA("DataModelMesh")
 			if mesh and mesh:IsA("SpecialMesh") and mesh.MeshType == Enum.MeshType.Head then
@@ -1625,7 +1835,16 @@ do
 		end
 		local info = state.charInfo
 		local bodyPart = R6_MESH[name]
-		if bodyPart and info and info.charMeshes and info.charMeshes[bodyPart] then
+		local meshId = bodyPart and info and info.charMeshes and info.charMeshes[bodyPart]
+		if meshId then
+			-- the package mesh is drawn at its own size, centred on the limb
+			state.charMesh = meshId
+			state.shadeKind = "charmesh"
+			local okContent, content = pcall(Content.fromUri, "rbxassetid://" .. tostring(meshId))
+			local probe = okContent and MeshProbe.get(content, state) or nil
+			if probe and probe.status == "ready" then
+				return Shapes.fromPoints("h" .. probe.key, probe.pts, probe.size, ZERO, false)
+			end
 			return Shapes.roundedBlock(size, BODY_ROUNDING[name] or 0.35)
 		end
 		return nil
@@ -1687,6 +1906,13 @@ do
 						return Shapes.fromMesh(entry, mul, add)
 					elseif waitForMesh(entry, state) and not character then
 						return nil, true
+					end
+				end
+				if character then
+					-- a classic hat or package head: the outline of its mesh, at the mesh's own size
+					local probe = MeshProbe.get(mesh.MeshContent, state)
+					if probe and probe.status == "ready" then
+						return Shapes.fromPoints("h" .. probe.key, probe.pts, probe.size * scale, offset, false)
 					end
 				end
 				return fallbackMeshShape(state, size * scale, offset, lod)
@@ -1928,7 +2154,7 @@ end
 -- Receiving faces in world space
 ----------------------------------------------------------------------------------------------------
 do
-	local function buildWorldFace(lf, cf, wf)
+	local function buildWorldFace(lf, cf, wf, lift)
 		local o = cf * lf.o
 		local nrm = cf:VectorToWorldSpace(lf.n)
 		local u = cf:VectorToWorldSpace(lf.u)
@@ -1945,9 +2171,12 @@ do
 		local oa, ob, oz = o:Dot(a), o:Dot(b), o:Dot(L)
 		wf.zo = oz
 		local ua, ub, va, vb = u:Dot(a), u:Dot(b), v:Dot(a), v:Dot(b)
-		local xs, ys = lf.exs, lf.eys
+		lift = lf.lift or lift
+		wf.lift = lift
+		local grown = grownFace(lf, lift)
+		local xs, ys = grown.xs, grown.ys
 		local minX, maxX, minY, maxY, minZ, maxZ = huge, -huge, huge, -huge, huge, -huge
-		for i = 1, lf.ecount do
+		for i = 1, grown.count do
 			local x, y = xs[i], ys[i]
 			local px = oa + ua * x + va * y
 			local py = ob + ub * x + vb * y
@@ -1989,8 +2218,10 @@ do
 		local list = state.wf or {}
 		local faces = shape.faces
 		local cf = state.part.CFrame
+		-- characters are seen up close: their shadows sit tighter on them
+		local lift = state.character and CONFIG.CharacterSurfaceOffset or CONFIG.SurfaceOffset
 		for i = 1, #faces do
-			list[i] = buildWorldFace(faces[i], cf, list[i] or {})
+			list[i] = buildWorldFace(faces[i], cf, list[i] or {}, lift)
 		end
 		for i = #list, #faces + 1, -1 do
 			list[i] = nil
@@ -2014,7 +2245,7 @@ do
 	-- A polygon in a face's 2D coordinates, lifted slightly off the face (facets of round parts
 	-- already float off the curve: lift 0).
 	function emitFace(wf, xs, ys, n, tint)
-		local o = wf.o + wf.n * (wf.lf.lift or CONFIG.SurfaceOffset)
+		local o = wf.o + wf.n * wf.lift
 		local u, v = wf.u, wf.v
 		local pts = Out.pts
 		local np = Out.np
@@ -2074,7 +2305,8 @@ do
 	local function finishPolygon(count, wf, g, tint)
 		local lf = wf.lf
 		-- cut to the face, grown past its edges so shadows on neighbouring faces meet
-		local n, xs, ys = clipByLines(PX, PY, count, lf.elines, lf.nLines)
+		local grown = grownFace(lf, wf.lift)
+		local n, xs, ys = clipByLines(PX, PY, count, grown.lines, grown.nLines)
 		if n < 3 then
 			return
 		end
@@ -2191,7 +2423,33 @@ do
 					SY[m] = rx * vx + ry * vy + rz * vz + d * kv
 				end
 			end
-			if kind == "poly" then
+			if kind == "mesh" and not g.tris then
+				-- an outline point cloud (convex): where it crosses the surface is the hull of the
+				-- crossings of every line between a point in front and a point behind (so a foot
+				-- that sinks a little into the floor still casts right up to it)
+				local behind, nb = SH, 0
+				for i = 1, n do
+					if DD[i] < -CONTACT then
+						nb += 1
+						behind[nb] = i
+					end
+				end
+				local stepB = max(1, ceil(nb * (m + 1) / 600)) -- keeps it to a few hundred pairs
+				for i = 1, n do
+					local di = DD[i]
+					if di > CONTACT then
+						local pi = pts[i]
+						for k = 1, nb, stepB do
+							local j = behind[k]
+							local p = pi:Lerp(pts[j], di / (di - DD[j]))
+							local rx, ry, rz = p.X - ox, p.Y - oy, p.Z - oz
+							m += 1
+							SX[m] = rx * ux + ry * uy + rz * uz
+							SY[m] = rx * vx + ry * vy + rz * vz
+						end
+					end
+				end
+			elseif kind == "poly" then
 				local edges = g.edges
 				for e = 1, #edges, 2 do
 					local i, j = edges[e], edges[e + 1]
@@ -2445,6 +2703,7 @@ end
 -- Rendering: Highlight-merged layers, EditableMesh pages, wedge-part fallback
 ----------------------------------------------------------------------------------------------------
 local Render = {meshOk = false, batch = false, layers = {}, lastSweep = 0}
+local BodyShade = {}
 do
 	local PAGE_CELL = 256      -- pages cover a 256-stud grid cell...
 	local PAGE_HALF = 256      -- ...plus up to 128 studs of overhang, inside fixed +-256 bounds
@@ -3024,6 +3283,11 @@ do
 		end
 	end
 
+	-- A copy of an avatar part, darkened by the Highlight like any shadow (see BodyShade).
+	function Render.styleShade(part)
+		styleShadowPart(part, Render.layers.main)
+	end
+
 	function Render.setVisible(on)
 		on = on and not holdHidden
 		for _, layer in pairs(Render.layers) do
@@ -3189,7 +3453,8 @@ do
 					end
 				end
 			elseif wf.s < MIN_LIT then
-				emitFace(wf, lf.exs, lf.eys, lf.ecount, false)
+				local grown = grownFace(lf, wf.lift)
+				emitFace(wf, grown.xs, grown.ys, grown.count, false)
 			end
 		end
 	end
@@ -3410,6 +3675,148 @@ do
 end
 
 ----------------------------------------------------------------------------------------------------
+-- Shadows on avatar parts whose surface can't be drawn on exactly (package meshes, R6 packages):
+-- when a part is inside a shadow, a slightly larger, invisible copy of it joins the shadow model,
+-- so the same Highlight darkens exactly the part's real shape (merged with every other shadow).
+----------------------------------------------------------------------------------------------------
+do
+	local shadeParams = RaycastParams.new()
+	shadeParams.FilterType = Enum.RaycastFilterType.Exclude
+	shadeParams.IgnoreWater = true
+	local GROW = 0.02      -- studs the copy is bigger than the part on each side
+	local PER_FRAME = 6    -- parts per character re-checked against the sun each frame
+
+	-- Does anything that casts a shadow sit between this point and the light?
+	local function blocked(origin, len)
+		local dir = Light.dir
+		for _ = 1, 4 do
+			local hit = Workspace:Raycast(origin, dir * len, shadeParams)
+			if not hit then
+				return false
+			end
+			local st = states[hit.Instance]
+			if st and st.isCaster and not st.dead and (st.ltmLevel or 0) < 2 then
+				return true
+			end
+			-- glass, parts that don't cast, invisible parts: look past them
+			local step = hit.Distance + 0.05
+			len -= step
+			if len <= 0 then
+				return false
+			end
+			origin += dir * step
+		end
+		return false
+	end
+
+	-- In shadow when at least two of three points along the part are.
+	local function inShadow(st)
+		local part = st.part
+		local cf, size = part.CFrame, part.Size
+		local len = CONFIG.MaxShadowLength
+		local up = cf.UpVector * (size.Y * 0.3)
+		local p = cf.Position
+		local n = (blocked(p, len) and 1 or 0) + (blocked(p + up, len) and 1 or 0)
+		if n == 1 then
+			n += blocked(p - up, len) and 1 or 0
+		end
+		return n >= 2
+	end
+
+	local function makeCopy(st)
+		local part = st.part
+		local copy = nil
+		pcall(function()
+			local archivable = part.Archivable
+			part.Archivable = true
+			copy = part:Clone()
+			part.Archivable = archivable
+		end)
+		if not copy then
+			return nil
+		end
+		-- no joints, attachments, scripts, decals or clothing: only the shape is wanted
+		for _, child in ipairs(copy:GetChildren()) do
+			pcall(child.Destroy, child)
+		end
+		if st.shadeKind == "charmesh" then
+			-- an R6 limb dressed in a package mesh: the copy shows that mesh too
+			local mesh = Instance.new("SpecialMesh")
+			mesh.MeshType = Enum.MeshType.FileMesh
+			mesh.MeshId = "rbxassetid://" .. tostring(st.charMesh)
+			mesh.Scale = V3(1.03, 1.03, 1.03)
+			mesh.Parent = copy
+		end
+		copy.Name = "BodyShade"
+		Render.styleShade(copy)
+		return copy
+	end
+
+	function BodyShade.update(info)
+		local main = Render.layers.main.model
+		shadeParams.FilterDescendantsInstances = {info.model, main, Render.layers.tint.model, Workspace.Terrain,
+			MeshProbe.model}
+		local members = info.members
+		local n = #members
+		if n == 0 then
+			return
+		end
+		-- re-check a few parts against the sun each frame (round robin)
+		local cursor = info.shadeCursor or 0
+		for _ = 1, min(n, PER_FRAME) do
+			cursor = cursor % n + 1
+			local st = members[cursor]
+			st.shaded = st.shadeKind ~= nil and not st.dead and st.isReceiver and (st.ltmLevel or 0) == 0
+				and Light.valid and inShadow(st)
+		end
+		info.shadeCursor = cursor
+		-- every frame: the copies of shaded parts follow them
+		for i = 1, n do
+			local st = members[i]
+			local copy = st.shadeCopy
+			if st.shaded and st.shadeKind and (st.ltmLevel or 0) == 0 then
+				if copy == nil then
+					copy = makeCopy(st) or false
+					st.shadeCopy = copy
+				end
+				if copy then
+					local part = st.part
+					local want = part.Size + V3(GROW * 2, GROW * 2, GROW * 2)
+					if copy.Size ~= want then
+						copy.Size = want
+					end
+					copy.CFrame = part.CFrame
+					if copy.Parent ~= main then
+						copy.Parent = main
+					end
+				end
+			elseif copy and copy.Parent then
+				copy.Parent = nil
+			end
+		end
+	end
+
+	function BodyShade.clear(info)
+		for _, st in ipairs(info.members) do
+			st.shaded = false
+			local copy = st.shadeCopy
+			if copy and copy.Parent then
+				copy.Parent = nil
+			end
+		end
+	end
+
+	function BodyShade.drop(st)
+		local copy = st.shadeCopy
+		st.shadeCopy = nil
+		st.shaded = false
+		if copy then
+			pcall(copy.Destroy, copy)
+		end
+	end
+end
+
+----------------------------------------------------------------------------------------------------
 -- Part registry
 ----------------------------------------------------------------------------------------------------
 do
@@ -3581,7 +3988,7 @@ do
 		end
 		local parent = part.Parent
 		local main, tint = Render.layers.main, Render.layers.tint
-		if parent == nil or parent == main.model or parent == tint.model then
+		if parent == nil or parent == main.model or parent == tint.model or (parent == MeshProbe.model and parent ~= nil) then
 			return
 		end
 		if not part:IsDescendantOf(Workspace) then
@@ -3662,6 +4069,7 @@ do
 		removeFromChunk(state)
 		dynamicStates[state] = nil
 		markDependentsDirty(state)
+		BodyShade.drop(state)
 		local info = state.charInfo
 		if info then
 			local members = info.members
@@ -3864,6 +4272,23 @@ do
 		end
 	end
 
+	-- Avatar outlines that arrived: redraw the parts that were waiting for them.
+	function processProbeReady()
+		while true do
+			local entry = qpop(MeshProbe.ready)
+			if not entry then
+				return
+			end
+			local users = entry.users
+			entry.users = setmetatable({}, {__mode = "k"})
+			for st in pairs(users) do
+				if not st.dead then
+					onShapeChanged(st)
+				end
+			end
+		end
+	end
+
 	function processMeshReady()
 		while true do
 			local entry = qpop(MeshData.ready)
@@ -3975,8 +4400,8 @@ do
 			if child:IsA("CharacterMesh") then
 				meshes = meshes or {}
 				local name = child.BodyPart.Name
-				meshes[name] = true
-				sig = sig .. name .. ","
+				meshes[name] = child.MeshId
+				sig = sig .. name .. tostring(child.MeshId) .. ","
 			end
 		end
 		local hum = model:FindFirstChildOfClass("Humanoid")
@@ -4271,9 +4696,16 @@ do
 						info.recvRec.builtAt = now
 					end
 				end
-			elseif info.recvRec then
-				dropRecord(info.recvRec)
-				info.recvRec = nil
+				-- package avatars: their real shape darkens where they stand in shadow
+				if CONFIG.ShadowsOnAvatars then
+					safeCall(BodyShade.update, info)
+				end
+			else
+				if info.recvRec then
+					dropRecord(info.recvRec)
+					info.recvRec = nil
+				end
+				BodyShade.clear(info)
 			end
 		end
 		-- moving parts, grouped by assembly: a whole car (or a tweened door model) is one job
@@ -4368,6 +4800,7 @@ do
 		processAdds(settled and now + 0.0015 or deadline, settled and 500 or CONFIG.RegisterPerFrame)
 		processChanges(now)
 		processMeshReady()
+		processProbeReady()
 		if not enabled then
 			return true
 		end
@@ -4511,7 +4944,7 @@ local function onDescendantAdded(inst)
 	end
 	local parent = inst.Parent
 	local main, tint = Render.layers.main, Render.layers.tint
-	if parent == main.model or parent == tint.model then
+	if parent == main.model or parent == tint.model or (parent ~= nil and parent == MeshProbe.model) then
 		return
 	end
 	if inst:IsA("BasePart") then
@@ -4593,6 +5026,29 @@ local function loadPause()
 			break
 		end
 		RunService.Heartbeat:Wait() -- let one frame through, then carry on
+	end
+	-- avatar outlines load in the background: wait a moment for your own character's (shadows
+	-- still hidden), so your shadow is already the right shape when everything appears
+	local function ownOutlinesLoading()
+		local char = LocalPlayer and LocalPlayer.Character
+		local info = char and characters[char]
+		if not info then
+			return false
+		end
+		for _, st in ipairs(info.members) do
+			local probe = st.probe
+			if probe and (probe.status == "queued" or probe.status == "loading") then
+				return true
+			end
+		end
+		return false
+	end
+	local waited = 0
+	while alive and enabled and waited < 3 and ownOutlinesLoading() do
+		waited += task.wait(0.05)
+	end
+	if waited > 0 and alive and enabled then
+		pcall(step, 1 / 60, 50, true)
 	end
 	stats.loadPauseMs = (clock() - t0) * 1000
 	holdHidden = false
