@@ -119,6 +119,12 @@ local CONFIG = {
 	                                      -- screen) so every nearby shadow appears at once
 	LoadPauseMax = 5,                     -- seconds the start-up pause may last at most
 	LoadPauseSlice = 1.2,                 -- it freezes in slices this long, with one frame between
+	LoadWholeMap = true,                  -- maps up to the size below are built completely during
+	                                      -- the pause and kept: nothing loads while you walk around
+	                                      -- (bigger maps load around you as you go)
+	WholeMapParts = 12000,                -- most parts for a whole-map load with EditableMesh...
+	PartsWholeMapParts = 4000,            -- ...and when drawing with parts
+	WholeMapPauseMax = 20,                -- seconds the pause may last for a whole-map load
 }
 
 ----------------------------------------------------------------------------------------------------
@@ -210,6 +216,7 @@ local physCursor = 1
 local nextStateId = 0
 local terrainPresent = false
 local initialScanDone = false
+local wholeMap = false        -- the whole map is built and kept (LoadWholeMap)
 local savedGlobalShadows = true
 local errorCount = 0
 local rebuildRequested = false
@@ -1959,7 +1966,8 @@ do
 			state.shadeKind = nil -- exact faces take shadows the normal way
 			return Shapes.box(size) -- the default blocky body: these parts really are boxes
 		end
-		state.shadeKind = (not state.accessory and part.Parent == state.character) and "mesh" or nil
+		-- body parts, hair and hats: dark sides and shade from copies of their real mesh
+		state.shadeKind = "mesh"
 		local content = part.MeshContent
 		-- 1. the real mesh, when the game lets meshes be read
 		local entry = MeshData.allowed and MeshData.get(content) or nil
@@ -2084,7 +2092,9 @@ do
 					end
 				end
 				if character then
-					-- a classic hat or package head: the outline of its mesh, at the mesh's own size
+					-- a classic hat or package head: the outline of its mesh, at the mesh's own size,
+					-- and its shading from copies of it (see BodyShade)
+					state.shadeKind = "part"
 					local probe = MeshProbe.get(mesh.MeshContent, state)
 					if probe and probe.status == "ready" then
 						return Shapes.fromPoints("h" .. probe.key, probe.pts, probe.size * scale, offset, false)
@@ -4003,7 +4013,8 @@ do
 							minY, maxY = min(minY, g.minY), max(maxY, g.maxY)
 							minZ, maxZ = min(minZ, g.minZ), max(maxZ, g.maxZ)
 						end
-						if CONFIG.ShadeBackFaces and shape.shade and not st.tint and not st.glow and fade == 0 then
+						if CONFIG.ShadeBackFaces and shape.shade and not st.tint and not st.glow and fade == 0
+							and not owner.fullShade then
 							emitBackFaces(st, shape)
 						end
 					end
@@ -4046,6 +4057,13 @@ do
 	end
 
 	local RECV = {}
+	-- Hair (or a helmet) wraps around the head: its outline is a blob holding the whole head, so
+	-- its "shadow" would black out the head and lie like a dark collar on the shoulders. Hair and
+	-- hats don't shadow their own character (they still shadow everything else).
+	local function wrapsAround(c, st)
+		return c.accessory == true and c.charInfo ~= nil and c.charInfo == st.charInfo
+	end
+
 	-- Shadows that land ON a character or a loose part, from anything between it and the light.
 	function buildReceiverRecord(owner, members, lod)
 		local rec = owner.recvRec
@@ -4054,7 +4072,7 @@ do
 			owner.recvRec = rec
 		end
 		resetOut()
-		if Light.valid then
+		if Light.valid and not owner.fullShade then -- (a whole shaded character has one Highlight)
 			local nr = 0
 			local minX, maxX, minY, maxY, minZ, maxZ = huge, -huge, huge, -huge, huge, -huge
 			for i = 1, #members do
@@ -4088,7 +4106,7 @@ do
 							if g.hullCount >= 3 then
 								for k = 1, nr do
 									local st = RECV[k]
-									if st ~= c then
+									if st ~= c and not wrapsAround(c, st) then
 										local faces = st.wf
 										for f = 1, #faces do
 											local wf = faces[f]
@@ -4173,8 +4191,22 @@ do
 		return n >= 2
 	end
 
+	-- Where a bone sits under its part ("Head/Jaw/..."), to pair a copy's bones with the real ones.
+	local function bonePath(bone, root)
+		local path = bone.Name
+		local node = bone.Parent
+		while node and node ~= root do
+			path = node.Name .. "/" .. path
+			node = node.Parent
+		end
+		return path
+	end
+
 	local function makeCopy(st)
 		local part = st.part
+		if part:FindFirstChildOfClass("WrapLayer") then
+			return nil -- layered clothing only takes its shape on the body
+		end
 		local copy = nil
 		pcall(function()
 			local archivable = part.Archivable
@@ -4185,13 +4217,35 @@ do
 		if not copy then
 			return nil
 		end
-		-- only the shape is wanted: no joints, attachments, scripts, decals or clothing (a Part
-		-- keeps the mesh that gives it its shape, like the classic head's)
-		for _, child in ipairs(copy:GetChildren()) do
-			if not child:IsA("DataModelMesh") then
+		-- only the shape is wanted: the mesh, and the bones a skinned mesh (a dynamic head) bends
+		-- with; no joints, attachments, face controls, scripts, decals or clothing
+		local bones = nil
+		for _, child in ipairs(copy:GetDescendants()) do
+			if child:IsA("Bone") then
+				bones = bones or {}
+				bones[bonePath(child, copy)] = child
+			elseif not child:IsA("DataModelMesh") then
 				pcall(child.Destroy, child)
 			end
 		end
+		if bones then
+			-- every frame the copy's bones take the real ones' pose (the face moves, so does its copy)
+			local pairsList = {}
+			for _, bone in ipairs(part:GetDescendants()) do
+				if bone:IsA("Bone") then
+					local twin = bones[bonePath(bone, part)]
+					if twin and twin.Parent then
+						pairsList[#pairsList + 1] = bone
+						pairsList[#pairsList + 1] = twin
+					end
+				end
+			end
+			st.copyBones = pairsList
+		end
+		local okSkin, skinned = pcall(function()
+			return part:IsA("MeshPart") and part.HasSkinnedMesh
+		end)
+		st.copySkinned = bones ~= nil or (okSkin and skinned == true)
 		if st.shadeKind == "charmesh" then
 			-- an R6 limb dressed in a package mesh: the copy shows that mesh too
 			local mesh = Instance.new("SpecialMesh")
@@ -4203,6 +4257,58 @@ do
 		copy.Name = "BodyShade"
 		Render.styleShade(copy)
 		return copy
+	end
+
+	-- A skinned copy finds its bones by name in its own model, so each character's skinned copies
+	-- get a model of their own (with the same Highlight trick as the shadow model).
+	local function skinModel(info)
+		local m = info.skinModel
+		if m == nil or m.Parent == nil then
+			m = Instance.new("Model")
+			m.Name = "SkinnedShade"
+			local hum = Instance.new("Humanoid")
+			hum.Name = "HighlightHost"
+			pcall(function()
+				hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+				hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
+				hum.RequiresNeck = false
+				hum.BreakJointsOnDeath = false
+				hum.EvaluateStateMachine = false
+			end)
+			hum.Parent = m
+			m.Parent = Render.layers.main.model
+			info.skinModel = m
+		end
+		return m
+	end
+
+	-- A whole character in shade (indoors, under a roof): one Highlight on the real avatar darkens
+	-- every bit of it exactly - face, hair, hands, glasses - instead of copies.
+	local function setFullShade(info, on)
+		local hl = info.fullHighlight
+		if on then
+			if hl == nil or hl.Parent == nil then
+				hl = Instance.new("Highlight")
+				hl.Name = "CharacterShade"
+				hl.FillColor = CONFIG.ShadowColor
+				hl.FillTransparency = CONFIG.ShadowTransparency
+				hl.OutlineTransparency = 1
+				hl.DepthMode = Enum.HighlightDepthMode.Occluded
+				info.fullHighlight = hl
+			end
+			hl.Adornee = info.model
+			hl.Enabled = true
+			if hl.Parent ~= Render.layers.main.model then
+				hl.Parent = Render.layers.main.model
+			end
+		elseif hl then
+			hl.Enabled = false
+			hl.Parent = nil
+		end
+	end
+
+	local function visibleMember(st)
+		return not st.dead and st.isReceiver and (st.ltmLevel or 0) == 0
 	end
 
 	-- A part either sits in a shadow (its copy, a hair bigger, darkens all of it), or it's lit and
@@ -4229,18 +4335,61 @@ do
 		for _ = 1, min(n, PER_FRAME) do
 			cursor = cursor % n + 1
 			local st = members[cursor]
-			st.shaded = st.shadeKind ~= nil and not st.polyReceive and not st.dead and st.isReceiver
-				and (st.ltmLevel or 0) == 0 and Light.valid and inShadow(st)
+			if visibleMember(st) and Light.valid then
+				st.inShade = inShadow(st)
+			else
+				st.inShade = nil
+			end
+			st.shaded = st.shadeKind ~= nil and not st.polyReceive and st.inShade == true
 		end
 		info.shadeCursor = cursor
+		-- the whole character in shade? (once on, it waits for two lit parts or a lasting one)
+		local lit, known = 0, 0
+		for i = 1, n do
+			local st = members[i]
+			if st.inShade ~= nil and visibleMember(st) then
+				known += 1
+				if not st.inShade then
+					lit += 1
+				end
+			end
+		end
+		local now = clock()
+		local full = info.fullShade
+		if full then
+			if lit == 0 then
+				info.litSince = nil
+			else
+				info.litSince = info.litSince or now
+				if lit >= 2 or now - info.litSince > 0.25 then
+					full = false
+				end
+			end
+		else
+			full = known > 0 and lit == 0 and Light.valid and not holdHidden
+		end
+		if full ~= (info.fullShade or false) then
+			info.fullShade = full
+			info.litSince = nil
+			setFullShade(info, full)
+			-- drawn polygons (dark sides, shadows on the head) give way to it, or come back
+			if info.casterRec then
+				info.casterRec.lightVersion = -1
+			end
+			if info.recvRec then
+				info.recvRec.lightVersion = -1
+			end
+		end
 		local push = 0.02 + (info.dist or 0) * 0.0005
 		local away = Light.dir * -push
+		local camera = Workspace.CurrentCamera
+		local camPos = camera and camera.CFrame.Position
 		-- every frame: the copies follow their parts
 		for i = 1, n do
 			local st = members[i]
 			local copy = st.shadeCopy
 			local mode = nil
-			if st.shadeKind and not st.dead and st.isReceiver and (st.ltmLevel or 0) == 0 and Light.valid then
+			if not full and st.shadeKind and visibleMember(st) and Light.valid then
 				if st.shaded then
 					mode = "whole"
 				elseif CONFIG.ShadeBackFaces then
@@ -4256,8 +4405,20 @@ do
 					local part = st.part
 					local size, cf, scale = part.Size, part.CFrame, 1
 					if mode == "whole" then
-						size += V3(GROW * 2, GROW * 2, GROW * 2)
-						scale = 1.03
+						if st.copySkinned then
+							-- a skinned mesh can't simply be made bigger: it moves a hair toward
+							-- the camera instead, so it covers the real one
+							if camPos then
+								local toCam = camPos - cf.Position
+								local d = toCam.Magnitude
+								if d > 1e-3 then
+									cf += toCam * ((0.02 + d * 0.0005) / d)
+								end
+							end
+						else
+							size += V3(GROW * 2, GROW * 2, GROW * 2)
+							scale = 1.03
+						end
 					else
 						cf += away
 					end
@@ -4269,8 +4430,15 @@ do
 					if mesh and mesh.Scale.X ~= scale then
 						mesh.Scale = V3(scale, scale, scale)
 					end
-					if copy.Parent ~= main then
-						copy.Parent = main
+					local bones = st.copyBones
+					if bones then
+						for b = 1, #bones - 1, 2 do
+							bones[b + 1].Transform = bones[b].Transform
+						end
+					end
+					local home = st.copySkinned and skinModel(info) or main
+					if copy.Parent ~= home then
+						copy.Parent = home
 					end
 				end
 			elseif copy and copy.Parent then
@@ -4282,16 +4450,35 @@ do
 	function BodyShade.clear(info)
 		for _, st in ipairs(info.members) do
 			st.shaded = false
+			st.inShade = nil
 			local copy = st.shadeCopy
 			if copy and copy.Parent then
 				copy.Parent = nil
 			end
+		end
+		if info.fullShade then
+			info.fullShade = false
+			setFullShade(info, false)
+		end
+	end
+
+	-- A character gone for good: its shade model and Highlight go too.
+	function BodyShade.forget(info)
+		BodyShade.clear(info)
+		if info.fullHighlight then
+			pcall(info.fullHighlight.Destroy, info.fullHighlight)
+			info.fullHighlight = nil
+		end
+		if info.skinModel then
+			pcall(info.skinModel.Destroy, info.skinModel)
+			info.skinModel = nil
 		end
 	end
 
 	function BodyShade.drop(st)
 		local copy = st.shadeCopy
 		st.shadeCopy = nil
+		st.copyBones = nil
 		st.shaded = false
 		if copy then
 			pcall(copy.Destroy, copy)
@@ -4397,9 +4584,10 @@ do
 		if not copy then
 			return nil
 		end
-		for _, child in ipairs(copy:GetChildren()) do
-			-- keep what gives it its shape (meshes) and its see-through cutouts (SurfaceAppearance)
-			if not (child:IsA("DataModelMesh") or child:IsA("SurfaceAppearance")) then
+		for _, child in ipairs(copy:GetDescendants()) do
+			-- keep what gives it its shape (meshes, and the bones a skinned mesh like a dynamic
+			-- head needs) and its see-through cutouts (SurfaceAppearance)
+			if not (child:IsA("DataModelMesh") or child:IsA("SurfaceAppearance") or child:IsA("Bone")) then
 				pcall(child.Destroy, child)
 			end
 		end
@@ -4912,6 +5100,7 @@ do
 				dropRecord(info.recvRec)
 				info.recvRec = nil
 				Silhouette.drop(info)
+				BodyShade.forget(info)
 				characters[info.model] = nil
 			end
 		end
@@ -5284,6 +5473,7 @@ do
 	local lastRefresh = -1
 	local lastTerrainCheck = -100
 	local lastCharacterRefresh = 0
+	local wholeMapChecked = nil
 
 	local function lodFor(d, current)
 		local h = (current == nil or current == 0) and 0 or 10
@@ -5301,21 +5491,41 @@ do
 		return x.dist < y.dist
 	end
 
+	-- LoadWholeMap: is the map small enough to build all of it and keep it?
+	local function checkWholeMap()
+		if not CONFIG.LoadWholeMap then
+			wholeMap = false
+			return
+		end
+		local n = 0
+		for _, ch in pairs(chunks) do
+			n += #ch.list
+		end
+		local limit = Render.meshOk and CONFIG.WholeMapParts or CONFIG.PartsWholeMapParts
+		wholeMap = n <= limit
+		stats.mapParts = n
+		stats.wholeMap = wholeMap
+	end
+
 	local function refreshChunks(camPos)
 		local R = CONFIG.ShadowDistance
 		if not Render.meshOk then
 			R = min(R, CONFIG.PartsShadowDistance)
 		end
+		local whole = wholeMap
 		local queue = {}
 		for _, ch in pairs(chunks) do
 			local d = max(0, (ch.center - camPos).Magnitude - ch.reach)
 			ch.dist = d
-			if d <= R then
+			if whole or d <= R then
 				if not ch.active then
 					ch.active = true
 					ch.needsScan = true
 				end
 				local lod = lodFor(d, ch.lod)
+				if whole and ch.lod ~= 0 and lod > ch.lod then
+					lod = ch.lod -- a kept map only gets finer as you come close, never rebuilt coarser
+				end
 				if lod ~= ch.lod then
 					ch.lod = lod
 					ch.needsScan = true
@@ -5682,6 +5892,15 @@ do
 			lastCharacterRefresh = now
 			refreshCharacters()
 		end
+		if initialScanDone and (wholeMapChecked == nil or now - wholeMapChecked > 3) then
+			-- (again every few seconds: a map that streams in or gets built on can outgrow it)
+			local was = wholeMap
+			wholeMapChecked = now
+			checkWholeMap()
+			if was ~= wholeMap then
+				refreshSoon = true
+			end
+		end
 		if warm or refreshSoon or now - lastRefresh > 0.25 then
 			refreshSoon = false
 			lastRefresh = now
@@ -5860,6 +6079,8 @@ local function loadPause()
 	local t0 = clock()
 	local stop = t0 + CONFIG.LoadPauseMax
 	while alive and enabled do
+		-- a map small enough to build completely gets a longer pause (decided once it's scanned)
+		stop = t0 + (wholeMap and max(CONFIG.WholeMapPauseMax, CONFIG.LoadPauseMax) or CONFIG.LoadPauseMax)
 		local sliceEnd = min(clock() + CONFIG.LoadPauseSlice, stop)
 		local done = false
 		repeat
