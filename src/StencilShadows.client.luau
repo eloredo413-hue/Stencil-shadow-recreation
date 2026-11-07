@@ -49,10 +49,10 @@ local CONFIG = {
 	SurfaceOffset = 0.04,                 -- how far shadows float off a surface (stops z-fighting)
 	CharacterSurfaceOffset = 0.012,       -- the same on characters (seen up close: kept tight)
 	ShadeBackFaces = true,                -- sides facing away from the light are shadowed too
-	CurvedShading = "Auto",               -- dark sides of balls / cylinders follow the real curve:
-	                                      -- "Auto" = all round parts with EditableMesh, only
-	                                      -- cylinders with parts (balls cost too many parts);
-	                                      -- true = always, false = never
+	RoundShading = "Blocky",              -- dark sides of balls / cylinders: "Blocky" = in steps,
+	                                      -- facet by facet, like the old engine's low-poly balls;
+	                                      -- "Smooth" = along the real curve (balls only with
+	                                      -- EditableMesh); false = left to Roblox's own shading
 	GlowingPartsStayLit = true,           -- Neon parts give off light: shadows don't darken them
 	TransparentShadows = false,           -- TRANSPARENT_SHADOWS_ENABLED: see-through parts cast
 	TransparentShadowTransparency = 0.75, -- ...lighter shadows tinted with their own color
@@ -227,7 +227,7 @@ local getShape, onShapeChanged, onPartChanged
 local markDirty, markDependentsDirty, addToChunk, removeFromChunk, queueUpstream
 local convexHull, clipLine, clipByLines, polyArea, reversePoly, edgeLines, setLine
 local updateLight, supportPoints, waitForMesh, getGeom, getWorldFaces
-local resetOut, emitFace, emitWorld, lightOverlap, castOnFace, drapeOnTerrain, grownFace
+local resetOut, emitFace, emitWorld, emitCore, lightOverlap, castOnFace, drapeOnTerrain, grownFace
 local queryBox, dropRecord, buildStaticCaster, buildDynamicCaster, buildReceiverRecord, safeCall
 local register, unregister, processChanges, processRemovals, processAdds, processCharacterChanges
 local processMeshReady, processProbeReady, processUpstream, pollPhysics, refreshCharacters, step
@@ -778,6 +778,9 @@ do
 		if shape.tris then
 			copy.tris = moved(shape.tris)
 		end
+		if shape.core then
+			copy.core = {c = shape.core.c + offset, r = shape.core.r}
+		end
 		if shape.ellipsoids then
 			local es = {}
 			for i, e in ipairs(shape.ellipsoids) do
@@ -863,13 +866,14 @@ do
 		end)
 	end
 
-	-- Cylinder outline: a prism whose flat sides touch the real curve.
-	local function prism(len, r, segs, axis)
+	-- Cylinder outline: a prism whose flat sides touch the real curve (`phase` 0: its corners sit at
+	-- whole steps around instead of half steps).
+	local function prism(len, r, segs, axis, phase)
 		local rc = r / cos(pi / segs)
 		local h = len / 2
 		local verts = {}
 		for i = 0, segs - 1 do
-			local t = (i + 0.5) * 2 * pi / segs
+			local t = (i + (phase or 0.5)) * 2 * pi / segs
 			local c, s = cos(t) * rc, sin(t) * rc
 			if axis == "X" then
 				verts[2 * i + 1] = V3(-h, c, s)
@@ -910,13 +914,14 @@ do
 		local slack = (SURFACE_FLOAT[lod] or 0.3) / max(R, 1e-3) - mrel
 		-- with parts every facet costs parts of its own, so fewer of them
 		local most = sphere and (meshMode and 36 or 20) or (meshMode and 64 or 24)
-		local m = most
+		local m = huge
 		if slack > 1e-4 then
 			-- a facet's corners are about this angle away from its middle
 			local delta = sqrt(2 * slack)
 			m = ceil(2 * pi / (delta * (sphere and 1.4142 or 2)))
 		end
-		return max(sphere and 16 or 12, min(most, m)), mrel
+		-- (the third value: how many it would take, before the caps)
+		return max(sphere and 16 or 12, min(most, m)), mrel, m
 	end
 
 	-- Smallest distance from the centre to the plane of any facet of a unit lat-long sphere
@@ -997,7 +1002,7 @@ do
 	-- {t, rho, term} from one end to the other, t = position along the axis, rho = radius
 	-- (0 = a pole); `term` belongs to the facets between that ring and the next. An end ring with
 	-- rho > 0 gets a flat cap with no term. `scale` (optional) stretches everything (ellipsoids).
-	local function latheShell(axis, e1, e2, rings, m, scale, faces)
+	local function latheShell(axis, e1, e2, rings, m, scale, faces, tag)
 		local verts = {}
 		local nr = #rings
 		for i = 1, nr do
@@ -1036,6 +1041,9 @@ do
 					local f = quickFace(loop, ZERO, term)
 					if f then
 						faces[#faces + 1] = f
+						if tag then
+							tag(f, i, j, loop)
+						end
 					end
 				end
 			end
@@ -1054,8 +1062,73 @@ do
 		end
 	end
 
+	-- "Blocky" round parts. The old engine drew balls with 16 x 8 flat facets (and cylinders with 16
+	-- sides), so their dark side came in steps, facet by facet. Here each of those classic facets
+	-- decides dark or lit for a patch of finer facets that hug the real curve (so nothing floats
+	-- off it), and the shadow a ball casts has the classic facets' outline.
+	local BLOCKY = CONFIG.RoundShading == "Blocky"
+	local CLASSIC_SIDES, CLASSIC_ROWS = 16, 8
+	-- Looser than SURFACE_FLOAT further away: those facets are a pixel or less off the curve
+	-- there, and every finer facet costs parts.
+	local BLOCKY_FLOAT = {0.07, 0.25, 0.5}
+
+	-- How many times finer than the classic facets the drawn ones are.
+	local function blockyRefine(R, r, lod, sphere)
+		local mrel = max(0.004, 0.012 / max(r, 1e-3))
+		local slack = (BLOCKY_FLOAT[lod] or 0.5) / max(R, 1e-3) - mrel
+		local want = huge
+		if slack > 1e-4 then
+			want = 2 * pi / (sqrt(2 * slack) * (sphere and 1.4142 or 2))
+		end
+		local most = sphere and (meshMode and 3 or 2) or (meshMode and 4 or 2)
+		return max(1, min(most, ceil(want / CLASSIC_SIDES - 1e-6))), mrel
+	end
+
+	local function unitPoint(th, ph)
+		local s = sin(th)
+		return V3(s * cos(ph), cos(th), s * sin(ph))
+	end
+
+	-- Largest angle between a unit direction and any of `points` (seen from the centre).
+	local function angularRadius(dir, points)
+		local worst = 1
+		for i = 1, #points do
+			local c = dir:Dot(points[i].Unit)
+			if c < worst then
+				worst = c
+			end
+		end
+		return math.acos(max(-1, min(1, worst)))
+	end
+
+	local function blockyCylinder(len, r, axisName, lod, offset)
+		local q, mrel = blockyRefine(r, r, lod, false)
+		local m = CLASSIC_SIDES * q
+		return cached(string.format("U%s%.3f,%.3f/%d", axisName, len, r, q), offset, function()
+			-- the outline: the classic 16 sides, corners on the curve
+			local shape = prism(len, r * cos(pi / CLASSIC_SIDES), CLASSIC_SIDES, axisName, 0)
+			local axis, e1, e2 = YAXIS, ZAXIS, XAXIS
+			if axisName == "X" then
+				axis, e1, e2 = XAXIS, YAXIS, ZAXIS
+			end
+			local rv = r * (1 + mrel) / cos(pi / m)
+			local h = len / 2 + CONFIG.SurfaceOffset
+			local faces = {}
+			latheShell(axis, e1, e2, {{-h, rv}, {h, rv}}, m, nil, faces, function(f, _, j)
+				local phi = 2 * pi * (floor(j / q) + 0.5) / CLASSIC_SIDES
+				f.cn = e1 * cos(phi) + e2 * sin(phi)
+			end)
+			shape.faces = faces
+			shape.blocky = true
+			return shape
+		end)
+	end
+
 	local function cylinderShape(len, r, axisName, lod, offset)
 		r = max(r, 1e-3)
+		if BLOCKY then
+			return blockyCylinder(len, r, axisName, lod, offset)
+		end
 		local segs = outlineSegments(lod)
 		local m, mrel = surfaceSegments(r, r, lod, false)
 		local key = string.format("%s%.3f,%.3f/%d/%d", axisName, len, r, segs, m)
@@ -1095,8 +1168,93 @@ do
 
 	local MIN_RADII = V3(1e-3, 1e-3, 1e-3)
 
+	-- A classic 16 x 8 ball (see blockyCylinder), stretched to `radii`.
+	local function blockyEllipsoid(radii, lod, offset)
+		local R, r = max(radii.X, radii.Y, radii.Z), min(radii.X, radii.Y, radii.Z)
+		local q, mrel = blockyRefine(R, r, lod, true)
+		return cached("Q" .. vkey(radii) .. "/" .. q, offset, function()
+			local SIDES, ROWS = CLASSIC_SIDES, CLASSIC_ROWS
+			local round = R - r < 1e-4 * R
+			-- the classic facets: their outline casts the shadow, their normals decide dark or lit
+			local verts = {V3(0, radii.Y, 0), V3(0, -radii.Y, 0)}
+			local function vid(i, j)
+				if i == 0 then
+					return 1
+				elseif i == ROWS then
+					return 2
+				end
+				return 3 + (i - 1) * SIDES + j % SIDES
+			end
+			for i = 1, ROWS - 1 do
+				for j = 0, SIDES - 1 do
+					verts[vid(i, j)] = unitPoint(pi * i / ROWS, 2 * pi * j / SIDES) * radii
+				end
+			end
+			local loops, cells = {}, {}
+			for i = 0, ROWS - 1 do
+				for j = 0, SIDES - 1 do
+					local loop
+					if i == 0 then
+						loop = {vid(0, 0), vid(1, j + 1), vid(1, j)}
+					elseif i == ROWS - 1 then
+						loop = {vid(i, j), vid(i, j + 1), vid(ROWS, 0)}
+					else
+						loop = {vid(i, j), vid(i, j + 1), vid(i + 1, j + 1), vid(i + 1, j)}
+					end
+					loops[#loops + 1] = loop
+					local pts = {}
+					for t = 1, #loop do
+						pts[t] = verts[loop[t]]
+					end
+					local nrm = newellNormal(pts).Unit
+					if nrm:Dot(averageOf(pts)) < 0 then
+						nrm = -nrm
+					end
+					local cell = {n = nrm}
+					if round then
+						-- where it sits on the ball, and how far it reaches from there (radians)
+						local t1, t2 = pi * i / ROWS, pi * (i + 1) / ROWS
+						local p1, p2 = 2 * pi * j / SIDES, 2 * pi * (j + 1) / SIDES
+						cell.d = unitPoint((t1 + t2) / 2, (p1 + p2) / 2)
+						cell.r = angularRadius(cell.d, {unitPoint(t1, p1), unitPoint(t1, p2), unitPoint(t2, p1),
+							unitPoint(t2, p2), unitPoint(t1, (p1 + p2) / 2), unitPoint(t2, (p1 + p2) / 2)})
+					end
+					cells[i * SIDES + j + 1] = cell
+				end
+			end
+			local shape = makePolyhedron(verts, loops, true)
+			-- the drawn facets: q x q of them per classic facet, just off the curve
+			local m, k = SIDES * q, ROWS * q
+			local push = (1 + mrel) / sphereClearance(m, k)
+			local rings = {}
+			for i = 0, k do -- unit sphere, +Y pole to -Y pole
+				local th = pi * i / k
+				rings[i + 1] = {cos(th) * push, (i == 0 or i == k) and 0 or sin(th) * push}
+			end
+			local faces = {}
+			latheShell(YAXIS, XAXIS, ZAXIS, rings, m, radii, faces, function(f, i, j, loop)
+				local cell = cells[floor((i - 1) / q) * SIDES + floor(j / q) + 1]
+				f.cn = cell.n
+				if round then
+					f.cd = f.o.Unit
+					f.cr = angularRadius(f.cd, loop)
+				end
+			end)
+			shape.faces = faces
+			shape.cells = cells
+			shape.blocky = true
+			shape.radius = R * push
+			-- a round ball's dark middle is drawn by one ball-shaped part (see emitBackFaces)
+			shape.core = round and {c = ZERO, r = R} or nil
+			return shape
+		end)
+	end
+
 	function Shapes.ellipsoid(radii, lod, offset)
 		radii = radii:Max(MIN_RADII)
+		if BLOCKY then
+			return blockyEllipsoid(radii, lod, offset)
+		end
 		local R = max(radii.X, radii.Y, radii.Z)
 		local m, mrel = surfaceSegments(R, min(radii.X, radii.Y, radii.Z), lod, true)
 		local segs = outlineSegments(lod)
@@ -2237,8 +2395,15 @@ do
 		local cf = state.part.CFrame
 		-- characters are seen up close: their shadows sit tighter on them
 		local lift = state.character and CONFIG.CharacterSurfaceOffset or CONFIG.SurfaceOffset
+		local dl = shape.blocky and cf:VectorToObjectSpace(Light.dir)
 		for i = 1, #faces do
-			list[i] = buildWorldFace(faces[i], cf, list[i] or {}, lift)
+			local lf = faces[i]
+			local wf = buildWorldFace(lf, cf, list[i] or {}, lift)
+			list[i] = wf
+			if dl and lf.cn and lf.cn:Dot(dl) < MIN_LIT then
+				-- part of a dark classic facet: drawn dark already, no shadows go on it
+				wf.s = -1
+			end
 		end
 		for i = #list, #faces + 1, -1 do
 			list[i] = nil
@@ -2251,12 +2416,26 @@ end
 ----------------------------------------------------------------------------------------------------
 -- Output: the shadow polygons produced by one job (world space)
 ----------------------------------------------------------------------------------------------------
-local Out = {pts = {}, sizes = {}, tints = {}, np = 0, nPoly = 0}
+local Out = {pts = {}, sizes = {}, tints = {}, np = 0, nPoly = 0, cores = {}, nCores = 0}
 
 do
 	function resetOut()
 		Out.np = 0
 		Out.nPoly = 0
+		Out.nCores = 0
+	end
+
+	-- The dark middle of a round ball, drawn as one ball-shaped part (see emitBackFaces): centre c,
+	-- radius r, `a` the way to the dark side, k = 1 - cos(how far from `a` it reaches).
+	function emitCore(c, a, r, k)
+		local n = Out.nCores + 1
+		Out.nCores = n
+		local t = Out.cores[n]
+		if not t then
+			t = {}
+			Out.cores[n] = t
+		end
+		t.c, t.a, t.r, t.k = c, a, r, k
 	end
 
 	-- A polygon in a face's 2D coordinates, lifted slightly off the face (facets of round parts
@@ -2719,7 +2898,7 @@ end
 ----------------------------------------------------------------------------------------------------
 -- Rendering: Highlight-merged layers, EditableMesh pages, wedge-part fallback
 ----------------------------------------------------------------------------------------------------
-local Render = {meshOk = false, batch = false, layers = {}, lastSweep = 0}
+local Render = {meshOk = false, batch = false, layers = {}, lastSweep = 0, cores = {}, camPos = Vector3.zero}
 local BodyShade = {}
 local Silhouette = {holder = nil}
 do
@@ -2773,7 +2952,7 @@ do
 			hl.Parent = model
 		end
 		local layer = {name = name, model = model, transparency = transparency, material = material, color = color,
-			pool = {}, blockPool = {}}
+			pool = {}, blockPool = {}, orbPool = {}}
 		Render.layers[name] = layer
 		return layer
 	end
@@ -2944,15 +3123,23 @@ do
 		end
 	end
 
-	-- kind "w": a WedgePart (half of a triangle), kind "b": a thin block (a whole rectangle)
+	-- kind "w": a WedgePart (half of a triangle), kind "b": a thin block (a whole rectangle),
+	-- kind "o": a ball (the dark middle of a round ball)
+	local function poolOf(layer, kind)
+		return kind == "b" and layer.blockPool or (kind == "o" and layer.orbPool or layer.pool)
+	end
+
 	local function acquirePart(layer, kind)
-		local pool = kind == "b" and layer.blockPool or layer.pool
+		local pool = poolOf(layer, kind)
 		local w = pool[#pool]
 		if w then
 			pool[#pool] = nil
 		else
-			w = Instance.new(kind == "b" and "Part" or "WedgePart")
-			w.Name = kind == "b" and "ShadowQuad" or "ShadowTri"
+			w = Instance.new(kind == "w" and "WedgePart" or "Part")
+			w.Name = kind == "b" and "ShadowQuad" or (kind == "o" and "ShadowCore" or "ShadowTri")
+			if kind == "o" then
+				w.Shape = Enum.PartType.Ball
+			end
 			styleShadowPart(w, layer)
 			stats.wedges += 1
 		end
@@ -2961,7 +3148,10 @@ do
 	end
 
 	local function releasePart(layer, kind, w)
-		local pool = kind == "b" and layer.blockPool or layer.pool
+		local pool = poolOf(layer, kind)
+		if kind == "o" then
+			Render.cores[w] = nil
+		end
 		if #pool < 4000 then
 			w.Parent = nil
 			pool[#pool + 1] = w
@@ -2995,6 +3185,68 @@ do
 		w2.Size = V3(WEDGE_THICKNESS, height, abs(ac:Dot(back)))
 		w2.CFrame = CFrame.fromMatrix((a + c) * 0.5, -right, up, -back)
 		return true
+	end
+
+	-- One wedge for a right-angled triangle: right angle at P, Q and R the other two corners.
+	local function placeRight(w, P, Q, R)
+		local back, up = P - Q, R - P
+		local d, h = back.Magnitude, up.Magnitude
+		if d < 1e-6 or h < 1e-6 then
+			return false
+		end
+		back /= d
+		up /= h
+		w.Size = V3(WEDGE_THICKNESS, h, d)
+		w.CFrame = CFrame.fromMatrix((Q + R) * 0.5, up:Cross(back), up, back)
+		return true
+	end
+
+	-- A 4-point polygon with two parallel sides (p1p2 and p4p3): a rectangle with a right-angled
+	-- triangle at either end, or nil. Returns the rectangle (CFrame, X size, Z size) and the two
+	-- triangles as {P, Q, R} lists (right angle at P; either may be false).
+	local TRAP_L, TRAP_R = {}, {}
+	local function trapezoidOf(p1, p2, p3, p4)
+		local e = p2 - p1
+		local a2 = e.Magnitude
+		if a2 < 1e-4 then
+			return nil
+		end
+		e /= a2
+		local top = p3 - p4
+		local tl = top.Magnitude
+		if tl < 1e-4 or e:Cross(top).Magnitude > 1e-4 * tl or e:Dot(top) < 0 then
+			return nil
+		end
+		local s4 = p4 - p1
+		local a4 = s4:Dot(e)
+		local hv = s4 - e * a4
+		local H = hv.Magnitude
+		if H < 1e-4 then
+			return nil
+		end
+		hv /= H
+		local a3 = (p3 - p1):Dot(e)
+		local lo, hi = max(0, a4), min(a2, a3)
+		if hi - lo < 1e-4 then
+			return nil
+		end
+		local left, right = false, false
+		if a4 > 1e-5 then
+			TRAP_L[1], TRAP_L[2], TRAP_L[3] = p1 + e * a4, p1, p4
+			left = TRAP_L
+		elseif a4 < -1e-5 then
+			TRAP_L[1], TRAP_L[2], TRAP_L[3] = p4 - e * a4, p4, p1
+			left = TRAP_L
+		end
+		if a3 < a2 - 1e-5 then
+			TRAP_R[1], TRAP_R[2], TRAP_R[3] = p1 + e * a3, p2, p3
+			right = TRAP_R
+		elseif a3 > a2 + 1e-5 then
+			TRAP_R[1], TRAP_R[2], TRAP_R[3] = p3 - e * (a3 - a2), p3, p2
+			right = TRAP_R
+		end
+		local center = p1 + e * ((lo + hi) * 0.5) + hv * (H * 0.5)
+		return CFrame.fromMatrix(center, e, e:Cross(hv)), hi - lo, H, left, right
 	end
 
 	-- A 4-point polygon that is a rectangle: its CFrame (X along the first edge, Y = normal) and size.
@@ -3038,7 +3290,16 @@ do
 			local color = colors and colors[(i + 1) / 2]
 			local placed = false
 			if k == 4 then
-				local cf, sx, sz = rectangleOf(pts[s], pts[s + 1], pts[s + 2], pts[s + 3])
+				local p1, p2, p3, p4 = pts[s], pts[s + 1], pts[s + 2], pts[s + 3]
+				local cf, sx, sz = rectangleOf(p1, p2, p3, p4)
+				local left, right = false, false
+				if not cf then
+					-- a trapezoid (like the facets of a ball): one block and two wedges, not four
+					cf, sx, sz, left, right = trapezoidOf(p1, p2, p3, p4)
+					if not cf then
+						cf, sx, sz, left, right = trapezoidOf(p2, p3, p4, p1)
+					end
+				end
 				if cf then
 					local b = bl[nb + 1]
 					if not b then
@@ -3051,6 +3312,21 @@ do
 						b.Color = color
 					end
 					nb += 1
+					for _, tri in ipairs({left, right}) do
+						if tri then
+							local w = wl[nw + 1]
+							if not w then
+								w = acquirePart(layer, "w")
+								wl[nw + 1] = w
+							end
+							if placeRight(w, tri[1], tri[2], tri[3]) then
+								if color then
+									w.Color = color
+								end
+								nw += 1
+							end
+						end
+					end
 					placed = true
 				end
 			end
@@ -3227,6 +3503,56 @@ do
 
 	local NO_POLYS = {}
 
+	-- A core ball pokes out of the real ball by `h` in the middle of its dark side and meets it
+	-- exactly where the classic facets' steps begin (see emitBackFaces). Further away, `h` grows,
+	-- so the two never fight over the same pixels.
+	local function fitCore(part, info, camPos)
+		local R, k = info.r, info.k
+		local h = min(0.02 + (info.c - camPos).Magnitude * 0.0004, R * 0.1)
+		local d = h * (h + 2 * R) / (2 * R * k + 2 * h)
+		local r2 = 2 * (R + h - d)
+		part.Size = V3(r2, r2, r2)
+		part.CFrame = CFrame.new(info.c + info.a * d)
+		info.h = h
+	end
+
+	local function commitCores(rec, layer, out)
+		local n = out.nCores
+		local parts = rec.parts
+		if n == 0 and not (parts and parts[layer.name .. "o"]) then
+			return
+		end
+		local list = partList(rec, layer, "o")
+		local camPos = Render.camPos
+		for i = 1, n do
+			local part = list[i]
+			if not part then
+				part = acquirePart(layer, "o")
+				list[i] = part
+			end
+			local src = out.cores[i]
+			local info = Render.cores[part] or {}
+			info.c, info.a, info.r, info.k = src.c, src.a, src.r, src.k
+			Render.cores[part] = info
+			fitCore(part, info, camPos)
+		end
+		for i = #list, n + 1, -1 do
+			releasePart(layer, "o", list[i])
+			list[i] = nil
+		end
+	end
+
+	-- Keeps every core's bulge right for how far away the camera is now.
+	function Render.updateCores(camPos)
+		Render.camPos = camPos
+		for part, info in pairs(Render.cores) do
+			local want = min(0.02 + (info.c - camPos).Magnitude * 0.0004, info.r * 0.1)
+			if abs(want - info.h) > 0.2 * info.h then
+				fitCore(part, info, camPos)
+			end
+		end
+	end
+
 	-- Replaces everything a record drew with the polygons in `out`.
 	function Render.commit(rec, out, pool)
 		releaseMesh(rec)
@@ -3267,6 +3593,7 @@ do
 			commitParts(rec, Render.layers.main, pts, mainPolys, nil)
 		end
 		commitParts(rec, Render.layers.tint, pts, tintPolys or NO_POLYS, tintColors)
+		commitCores(rec, Render.layers.main, out)
 		commitRec = nil
 	end
 
@@ -3359,7 +3686,7 @@ do
 		table.clear(allPages)
 		for _, layer in pairs(Render.layers) do
 			pcall(layer.model.Destroy, layer.model)
-			for _, pool in ipairs({layer.pool, layer.blockPool}) do
+			for _, pool in ipairs({layer.pool, layer.blockPool, layer.orbPool}) do
 				for _, w in ipairs(pool) do
 					pcall(w.Destroy, w)
 				end
@@ -3417,17 +3744,119 @@ do
 	-- (each facet is one thin block); ball-like surfaces need many triangles, so with parts they
 	-- keep Roblox's own shading unless CurvedShading is true.
 	local function curvedShading(term)
-		local mode = CONFIG.CurvedShading
-		if mode == false then
+		if CONFIG.RoundShading == false then
 			return false
 		end
-		return mode == true or term.axis ~= nil or Render.meshOk
+		return term.axis ~= nil or Render.meshOk
+	end
+
+	local sunParams = RaycastParams.new()
+	sunParams.FilterType = Enum.RaycastFilterType.Exclude
+	sunParams.IgnoreWater = true
+	local sunSkip = {}
+
+	-- The still shadow caster between this point and the light, if any (sunParams set by the caller).
+	local function sunBlocker(origin)
+		local dir = Light.dir
+		local len = CONFIG.MaxShadowLength
+		for _ = 1, 4 do
+			local hit = Workspace:Raycast(origin, dir * len, sunParams)
+			if not hit then
+				return nil
+			end
+			local st = states[hit.Instance]
+			if st and st.isCaster and not st.dead and not st.dynamic and not st.character then
+				return st
+			end
+			local step = hit.Distance + 0.05
+			len -= step
+			if len <= 0 then
+				return nil
+			end
+			origin += dir * step
+		end
+		return nil
+	end
+
+	local CORE_EDGE = rad(6) -- facets are still drawn this far inside the core's edge
+	local arccos = math.acos
+
+	-- Blocky round parts (see blockyEllipsoid): each classic facet is dark or lit as a whole, so
+	-- the dark side ends in steps. A round ball's dark middle (everything up to the nearest lit
+	-- classic facet) is one ball-shaped part that pokes out of it a hair; facets do the rest.
+	local function emitBlocky(state, shape, faces, rec)
+		local cf = state.part.CFrame
+		local dl = cf:VectorToObjectSpace(Light.dir)
+		local core, a, reach = shape.core, -dl, nil
+		if core then
+			local nearest = pi
+			for _, cell in ipairs(shape.cells) do
+				if cell.n:Dot(dl) >= MIN_LIT then
+					local ang = arccos(max(-1, min(1, cell.d:Dot(a)))) - cell.r
+					if ang < nearest then
+						nearest = ang
+					end
+				end
+			end
+			local theta0 = nearest - rad(1)
+			if theta0 > rad(35) then
+				emitCore(cf * core.c, cf:VectorToWorldSpace(a), core.r, 1 - cos(theta0))
+				reach = theta0 - CORE_EDGE
+			end
+		end
+		local filterSet = false
+		for i = 1, #faces do
+			local wf = faces[i]
+			local lf = wf.lf
+			local cn = lf.cn
+			if cn then
+				if cn:Dot(dl) < MIN_LIT then
+					if not (reach and reach > lf.cr and lf.cd:Dot(a) > cos(reach - lf.cr)) then
+						emitFace(wf, lf.xs, lf.ys, lf.count, false)
+					end
+				elseif wf.s < MIN_LIT and rec and not state.dynamic then
+					-- a lit classic facet where the real curve already turns from the light: shadows
+					-- can't be cast onto it, so look for something in the way of the light directly
+					if not filterSet then
+						filterSet = true
+						sunSkip[1], sunSkip[2], sunSkip[3] = state.part, Render.layers.main.model, Render.layers.tint.model
+						sunParams.FilterDescendantsInstances = sunSkip
+					end
+					local blocker = sunBlocker(wf.o + wf.n * 0.05)
+					if blocker then
+						emitFace(wf, lf.xs, lf.ys, lf.count, false)
+						-- redraw when that blocker moves or goes
+						local deps = blocker.dependents
+						if not deps then
+							deps = {}
+							blocker.dependents = deps
+						end
+						if not deps[rec] then
+							deps[rec] = true
+							local touched = rec.receivers
+							if not touched then
+								touched = {}
+								rec.receivers = touched
+							end
+							touched[#touched + 1] = blocker
+						end
+					end
+				end
+			elseif wf.s < MIN_LIT then
+				local grown = grownFace(lf, wf.lift)
+				emitFace(wf, grown.xs, grown.ys, grown.count, false)
+			end
+		end
 	end
 
 	local DX, DY = {}, {}
 	-- The sides of a part that face away from the light are inside its own shadow volume.
-	local function emitBackFaces(state, shape)
+	local function emitBackFaces(state, shape, rec)
 		local faces = getWorldFaces(state, shape)
+		if shape.blocky then
+			emitBlocky(state, shape, faces, rec)
+			return
+		end
 		local terms = shape.terms
 		local planes = nil
 		if terms then
@@ -3534,7 +3963,7 @@ do
 				end
 			end
 			if CONFIG.ShadeBackFaces and shape.shade and not state.tint and not state.glow then
-				emitBackFaces(state, shape)
+				emitBackFaces(state, shape, rec)
 			end
 		end
 		Render.commit(rec, Out, "static")
@@ -3583,16 +4012,18 @@ do
 			if ng > 0 then
 				local parts = queryBox(minX - MARGIN, maxX + MARGIN, minY - MARGIN, maxY + MARGIN,
 					minZ - MARGIN, maxZ + CONFIG.MaxShadowLength)
-				local skip = owner.silFloor -- that floor shows the exact silhouette instead
+				-- the floor plane showing the exact silhouette gets no polygons from this character
+				local plane = owner.silPlane
+				local pn, pd = plane and plane.n, plane and plane.d
 				for i = 1, #parts do
 					local r = states[parts[i]]
-					if r and r.isReceiver and not r.dynamic and r.part ~= skip then
+					if r and r.isReceiver and not r.dynamic then
 						local rshape = getShape(r, lod)
 						if rshape and rshape.faces then
 							local faces = getWorldFaces(r, rshape)
 							for f = 1, #faces do
 								local wf = faces[f]
-								if wf.s > MIN_LIT then
+								if wf.s > MIN_LIT and not (pn and wf.n:Dot(pn) > 0.999 and abs(wf.o:Dot(pn) - pd) < 0.03) then
 									for k = 1, ng do
 										local g = geoms[k]
 										if lightOverlap(g, wf) then
@@ -4012,11 +4443,6 @@ do
 		return false
 	end
 
-	local function isBlock(part)
-		return part.ClassName ~= "WedgePart" and part:IsA("Part") and part.Shape == Enum.PartType.Block
-			and part:FindFirstChildWhichIsA("DataModelMesh") == nil
-	end
-
 	function Silhouette.hide(info)
 		local view = info.sil
 		if view and view.shown then
@@ -4065,11 +4491,11 @@ do
 		local filter = filterList(info)
 		floorParams.FilterDescendantsInstances = filter
 		litParams.FilterDescendantsInstances = filter
-		-- 1. the floor under the character: a still block
+		-- 1. the floor under the character: something still and flat
 		local hit = Workspace:Raycast(root.Position, V3(0, -60, 0), floorParams)
 		local floorPart = hit and hit.Instance
 		local fst = floorPart and states[floorPart]
-		if not fst or fst.dynamic or not fst.isReceiver or not isBlock(floorPart) then
+		if not fst or fst.dynamic or not fst.isReceiver then
 			Silhouette.hide(info)
 			return nil
 		end
@@ -4087,10 +4513,11 @@ do
 		-- 2. where the shadow falls: every visible part's box, pushed along the light onto the floor
 		local F = hit.Position
 		local umin, umax, vmin, vmax = huge, -huge, huge, -huge
-		local any = false
+		local spots = info.silSpots or {}
+		info.silSpots = spots
+		local ns = 0
 		for _, st in ipairs(info.members) do
 			if st.isCaster and not st.dead and (st.ltmLevel or 0) < 2 then
-				any = true
 				local cf, size = st.part.CFrame, st.part.Size
 				for k = 1, 8 do
 					local P = cf * (CORNERS[k] * size)
@@ -4101,9 +4528,16 @@ do
 					umin, umax = min(umin, a), max(umax, a)
 					vmin, vmax = min(vmin, b), max(vmax, b)
 				end
+				-- where the middle of this part's shadow lands (to see if it falls in the light)
+				local P = cf.Position
+				ns += 1
+				spots[ns] = P + L * (max((P - F):Dot(n), 0) / sinE)
 			end
 		end
-		if not any then
+		for i = #spots, ns + 1, -1 do
+			spots[i] = nil
+		end
+		if ns == 0 then
 			Silhouette.hide(info)
 			return nil
 		end
@@ -4111,28 +4545,39 @@ do
 		local W = max(vmax - vmin, (umax - umin) * sinE)
 		local Lu = W / sinE
 		local center = F + u * ((umin + umax) * 0.5) + v * ((vmin + vmax) * 0.5)
-		-- 3. the whole canvas has to lie on this face of the block, in the light
-		local fcf, half = floorPart.CFrame, floorPart.Size * 0.5
-		local ln = fcf:VectorToObjectSpace(n)
-		local an = abs(ln.X) > 0.999 and 1 or (abs(ln.Y) > 0.999 and 2 or (abs(ln.Z) > 0.999 and 3 or 0))
-		if an == 0 then
+		-- 3. the floor has to carry on, flat, under the whole canvas (it may be many parts: tiles,
+		-- a baseplate in pieces), or the shadow would hang in the air past an edge
+		for k = 0, 15 do
+			local su, sv = (k % 4) / 3 - 0.5, floor(k / 4) / 3 - 0.5
+			local c = center + u * (Lu * su) + v * (W * sv)
+			local down = Workspace:Raycast(c + n * 0.3, n * -0.6, floorParams)
+			local dst = down and states[down.Instance]
+			if not down or abs(down.Distance - 0.3) > 0.03 or down.Normal:Dot(n) < 0.999 or not dst
+				or dst.dynamic or not dst.isReceiver then
+				Silhouette.hide(info)
+				return nil
+			end
+		end
+		-- 4. and mostly in the light: a silhouette inside another shadow would make it darker
+		-- (a few spots are re-checked each frame; it switches over with a margin, not back and forth)
+		local lit = info.silLit or {}
+		info.silLit = lit
+		local cursor = info.silCursor or 0
+		for _ = 1, min(ns, 6) do
+			cursor = cursor % ns + 1
+			lit[cursor] = not shaded(spots[cursor] + n * 0.05)
+		end
+		info.silCursor = cursor
+		local nl = 0
+		for i = 1, ns do
+			if lit[i] ~= false then
+				nl += 1
+			end
+		end
+		local share = nl / ns
+		if share < (info.sil and info.sil.shown and 0.6 or 0.8) then
 			Silhouette.hide(info)
 			return nil
-		end
-		local du, dv = u * (Lu * 0.5), v * (W * 0.5)
-		for k = 0, 8 do
-			local su, sv = (k % 3) - 1, floor(k / 3) - 1
-			local c = center + du * su + dv * sv
-			local lp = fcf:PointToObjectSpace(c)
-			if (an ~= 1 and abs(lp.X) > half.X + 0.01) or (an ~= 2 and abs(lp.Y) > half.Y + 0.01)
-				or (an ~= 3 and abs(lp.Z) > half.Z + 0.01) then
-				Silhouette.hide(info)
-				return nil
-			end
-			if shaded(c + n * 0.05) then
-				Silhouette.hide(info)
-				return nil
-			end
 		end
 		-- 4. show it
 		local view = info.sil
@@ -4189,7 +4634,11 @@ do
 			view.canvas.Parent = holderModel()
 			view.gui.Enabled = true
 		end
-		return floorPart
+		-- the polygons leave this floor plane to the silhouette
+		local plane = info.silPlaneT or {}
+		info.silPlaneT = plane
+		plane.n, plane.d = n, F:Dot(n)
+		return string.format("%.3f,%.3f,%.3f,%.3f", n.X, n.Y, n.Z, plane.d)
 	end
 end
 
@@ -5067,6 +5516,7 @@ do
 			end
 			if silFloor ~= info.silFloor then
 				info.silFloor = silFloor
+				info.silPlane = silFloor and info.silPlaneT or nil
 				moved = true
 			end
 			if CONFIG.CharacterShadows and casting < CONFIG.MaxCharacters and info.dist <= CONFIG.DynamicDistance then
@@ -5238,6 +5688,7 @@ do
 			refreshChunks(camPos)
 		end
 		processDynamic(camPos, now, deadline)
+		Render.updateCores(camPos)
 		local staticDone = false
 		if initialScanDone then
 			processUpstream(deadline)
