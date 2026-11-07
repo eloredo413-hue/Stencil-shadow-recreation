@@ -23,18 +23,26 @@ Script: [`src/StencilShadows.client.luau`](src/StencilShadows.client.luau)
   - Mesh shadows use the real triangles when the mesh can be read, so concave shapes such as arches
     and L-shapes keep their holes.
   - If a mesh can't be read, its outline is sampled with raycasts instead.
-- **Characters cast their real silhouette**, R6 and R15, with packages, hats, hair and tools.
-  - Most games don't let scripts read avatar meshes, and give avatars plain box collisions. But any
-    script may create a copy of a mesh with an exact convex-hull collision shape. The script makes
-    one hidden copy per mesh, outlines it with raycasts, and casts each body part's real outline.
+- **Characters cast their exact silhouette**, R6 and R15, with packages, hats, hair and tools.
+  - On a flat, lit floor (most of the time), a black copy of the character is drawn as seen from
+    the sun, in a ViewportFrame on a SurfaceGui lying on the floor. It's stretched along the sun's
+    direction so every point lands where its shadow falls. Hair spikes, hats, clothing, tools and
+    the exact pose all show.
+  - Where that can't work (the shadow crosses an edge or stairs, or falls inside another shadow),
+    each part casts its real outline instead. That outline comes from a hidden copy of each mesh
+    with an exact convex-hull collision shape, traced once with raycasts. Any script may make
+    these copies, even where avatar meshes can't be read.
   - Until an outline has loaded (a second or two after an avatar appears), or if it can't be
     loaded, a part casts a rounded block of its real size.
   - Default blocky bodies (R6, and R15 with the default body) are real boxes and are drawn exactly.
 - **Shadows land on players too.**
   - Blocky bodies take exact shadows, cut where a shadow's edge crosses them, and their sides away
     from the sun are dark. These sit 0.012 studs off the body, so they don't look oversized.
-  - On package avatars, a body part inside a shadow gets a slightly larger invisible copy in the
-    shadow model, so the same Highlight darkens exactly that part's real shape.
+  - On package avatars and on every head, each part has an invisible copy in the shadow model,
+    so the same Highlight darkens exactly the part's real shape. Inside a shadow, the copy is a hair
+    bigger than the part and all of it darkens. In the light, the copy is pushed a hair away from
+    the sun, so it only pokes out of the real part on the side facing away from the sun, and only
+    that side darkens, as it did inside the old shadow volumes.
   - Nothing that doesn't match the avatar's real shape is drawn on it, so no dark cubes stick out.
   - Zoomed into first person, your own character's shadows disappear along with it, as they do
     with Roblox's shadows.
@@ -49,6 +57,8 @@ Script: [`src/StencilShadows.client.luau`](src/StencilShadows.client.luau)
     line exactly where the surface turns away from the sun. It doesn't float off the part or follow
     blocky facets.
   - Glowing (Neon) parts give off light, so shadows don't darken them.
+- **Building tools work.** Parts spawned, cloned, dragged, resized or deleted (BTools, F3X, scripts)
+  get their shadows updated by the next frame.
 - **Moving things update every frame.**
   - Characters, unanchored parts, vehicles (one shadow job per assembly), and tweened parts all
     update.
@@ -78,7 +88,9 @@ Everything is in the `CONFIG` table at the top of the script. The most useful se
 | `ShadeBackFaces` | `true` | Darken the sides of parts that face away from the sun. |
 | `CurvedShading` | `"Auto"` | Smooth dark sides on round parts. `"Auto"` does all round parts with EditableMesh, and only cylinders when drawing with parts, because balls would need too many parts. |
 | `GlowingPartsStayLit` | `true` | Neon parts are never darkened. |
-| `AvatarOutlines` | `true` | Cast avatars' real outlines, using hidden hull copies of their meshes. |
+| `ExactSilhouettes` | `true` | On flat lit floors, characters cast their exact silhouette (ViewportFrame). |
+| `MaxSilhouettes` | `4` | How many characters (nearest first) can have one at a time. |
+| `AvatarOutlines` | `true` | Elsewhere, cast avatars' real outlines, using hidden hull copies of their meshes. |
 | `ShadowsOnAvatars` | `true` | Darken package avatars' body parts when they stand in a shadow. |
 | `CharacterSurfaceOffset` | `0.012` | How far shadows float off characters (the map uses `SurfaceOffset`, 0.04). |
 | `LoadPause` | `true` | Freeze briefly at the start so all nearby shadows appear at once (no loading screen). |
@@ -161,10 +173,13 @@ What that means inside a building:
     enough (`MeshReceiverTriangles`).
   - Otherwise, flat meshes and unions use their bounding box.
 - **Avatars.**
-  - Each body part's outline is convex, so a gap inside one part (between fingers, say) is filled
-    in. Gaps between parts, like between the legs, show.
+  - The exact silhouette needs the whole shadow on one flat, lit face of a block (a Part, not a
+    mesh, union or terrain). Elsewhere each body part casts its convex outline, so a gap inside one
+    part (between hair spikes, say) is filled in there.
+  - The silhouette is a texture, so its edges are a little softer than the other shadows. Layered
+    clothing isn't part of it (it only takes its shape on the body).
   - On package avatars a body part darkens as a whole when it's mostly in shadow. A shadow edge
-    can't cut across the part, and its side away from the sun isn't darkened separately.
+    can't cut across the part.
   - Layered clothing isn't darkened.
 - **Jagged edges on phones.** Roblox draws Highlights without anti-aliasing, so shadow edges look a
   little pixelated, mostly on mobile
@@ -183,11 +198,13 @@ What that means inside a building:
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 43 scenarios compare the shadow triangles it draws against independently computed projections.
+The 47 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover every shape, clipping, sunk casters, moving and resting parts, vehicles, removal,
 characters (R6, R15, packages, blocky bodies, the classic head, first person), the toggle key, the
 wedge-part fallback, exact concave meshes, ray-sampled meshes, terrain, sun, moon and night,
 oversized shadows split across pages, tight time budgets, streaming, EditableMesh memory running
 out, failed mesh loads, edges meeting without gaps, round parts without gaps or floating, Neon
 parts, the start-up pause, avatar outlines from hull copies, package avatars darkening in shadow,
-tight shading on blocky players, shadows falling 450 studs, and parts sunk into the floor.
+tight shading on blocky players, shadows falling 450 studs, parts sunk into the floor, dark sides
+on heads, the exact silhouette (that every body point's shadow lands at the same spot on the canvas
+and in the camera image), its fallbacks, and building tools.

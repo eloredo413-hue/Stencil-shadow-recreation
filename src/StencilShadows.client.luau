@@ -91,6 +91,8 @@ local CONFIG = {
 	CharacterShadows = true,
 	AccessoryShadows = true,
 	AvatarOutlines = true,                -- real avatar outlines from hidden hull copies of their meshes
+	ExactSilhouettes = true,              -- on flat lit floors, characters cast their exact silhouette
+	MaxSilhouettes = 4,                   -- characters (nearest first) that can have one at a time
 	ShadowsOnAvatars = true,              -- package avatars darken in shadow (real mesh shape)
 	IgnoreAttribute = "NoStencilShadow",  -- set this attribute to true on a part / model to skip it
 
@@ -142,6 +144,8 @@ local tsort, tremove, tcreate = table.sort, table.remove, table.create
 local CONTAINER_NAME = "__StencilShadows"
 local TINT_CONTAINER_NAME = "__StencilShadowsTinted"
 local PROBE_NAME = "__StencilShadowsProbe"
+local SILHOUETTE_NAME = "__StencilShadowsSilhouettes"
+local SILHOUETTE_GUI = "StencilSilhouette"
 local SAVED_SHADOWS_ATTR = "StencilShadowsSavedGlobalShadows"
 
 local CONTACT = 0.01       -- studs; caster points this close to a surface count as touching it
@@ -172,9 +176,17 @@ do
 			end
 		end
 	end
+	local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if playerGui then
+		for _, child in ipairs(playerGui:GetChildren()) do
+			if child.Name == SILHOUETTE_GUI then
+				pcall(child.Destroy, child)
+			end
+		end
+	end
 	for _, child in ipairs(Workspace:GetChildren()) do
 		local name = child.Name
-		if name == CONTAINER_NAME or name == TINT_CONTAINER_NAME or name == PROBE_NAME
+		if name == CONTAINER_NAME or name == TINT_CONTAINER_NAME or name == PROBE_NAME or name == SILHOUETTE_NAME
 			or name == "__StencilShadowReceivers" then
 			pcall(child.Destroy, child)
 		end
@@ -1784,6 +1796,7 @@ do
 		local name = part.Name
 		local info = state.charInfo
 		local field = DESC_FIELD[name]
+		state.polyReceive = nil
 		if field and info and info.blocky and info.blocky[field] then
 			state.shadeKind = nil -- exact faces take shadows the normal way
 			return Shapes.box(size) -- the default blocky body: these parts really are boxes
@@ -1826,9 +1839,13 @@ do
 		local name = part.Name
 		state.charMesh = nil
 		state.shadeKind = nil
+		state.polyReceive = nil
 		if name == "Head" then
 			local mesh = part:FindFirstChildWhichIsA("DataModelMesh")
 			if mesh and mesh:IsA("SpecialMesh") and mesh.MeshType == Enum.MeshType.Head then
+				-- shadows land on it as polygons; its dark side comes from a copy (see BodyShade)
+				state.shadeKind = "part"
+				state.polyReceive = true
 				local scale = mesh.Scale
 				return Shapes.classicHead(size.Y * scale.Y, min(size.X, size.Y, size.Z) * scale.X, lod, mesh.Offset)
 			end
@@ -2438,10 +2455,10 @@ do
 				for i = 1, n do
 					local di = DD[i]
 					if di > CONTACT then
-						local pi = pts[i]
+						local front = pts[i]
 						for k = 1, nb, stepB do
 							local j = behind[k]
-							local p = pi:Lerp(pts[j], di / (di - DD[j]))
+							local p = front:Lerp(pts[j], di / (di - DD[j]))
 							local rx, ry, rz = p.X - ox, p.Y - oy, p.Z - oz
 							m += 1
 							SX[m] = rx * ux + ry * uy + rz * uz
@@ -2704,6 +2721,7 @@ end
 ----------------------------------------------------------------------------------------------------
 local Render = {meshOk = false, batch = false, layers = {}, lastSweep = 0}
 local BodyShade = {}
+local Silhouette = {holder = nil}
 do
 	local PAGE_CELL = 256      -- pages cover a 256-stud grid cell...
 	local PAGE_HALF = 256      -- ...plus up to 128 studs of overhang, inside fixed +-256 bounds
@@ -3565,9 +3583,10 @@ do
 			if ng > 0 then
 				local parts = queryBox(minX - MARGIN, maxX + MARGIN, minY - MARGIN, maxY + MARGIN,
 					minZ - MARGIN, maxZ + CONFIG.MaxShadowLength)
+				local skip = owner.silFloor -- that floor shows the exact silhouette instead
 				for i = 1, #parts do
 					local r = states[parts[i]]
-					if r and r.isReceiver and not r.dynamic then
+					if r and r.isReceiver and not r.dynamic and r.part ~= skip then
 						local rshape = getShape(r, lod)
 						if rshape and rshape.faces then
 							local faces = getWorldFaces(r, rshape)
@@ -3735,27 +3754,40 @@ do
 		if not copy then
 			return nil
 		end
-		-- no joints, attachments, scripts, decals or clothing: only the shape is wanted
+		-- only the shape is wanted: no joints, attachments, scripts, decals or clothing (a Part
+		-- keeps the mesh that gives it its shape, like the classic head's)
 		for _, child in ipairs(copy:GetChildren()) do
-			pcall(child.Destroy, child)
+			if not child:IsA("DataModelMesh") then
+				pcall(child.Destroy, child)
+			end
 		end
 		if st.shadeKind == "charmesh" then
 			-- an R6 limb dressed in a package mesh: the copy shows that mesh too
 			local mesh = Instance.new("SpecialMesh")
 			mesh.MeshType = Enum.MeshType.FileMesh
 			mesh.MeshId = "rbxassetid://" .. tostring(st.charMesh)
-			mesh.Scale = V3(1.03, 1.03, 1.03)
 			mesh.Parent = copy
+			st.copyMesh = mesh
 		end
 		copy.Name = "BodyShade"
 		Render.styleShade(copy)
 		return copy
 	end
 
+	-- A part either sits in a shadow (its copy, a hair bigger, darkens all of it), or it's lit and
+	-- only its side away from the light is dark: its copy is pushed a hair away from the light, so
+	-- the copy only pokes out of the real part on that side, and the Highlight darkens exactly the
+	-- real surface there - the same thing the old shadow volumes did.
 	function BodyShade.update(info)
 		local main = Render.layers.main.model
-		shadeParams.FilterDescendantsInstances = {info.model, main, Render.layers.tint.model, Workspace.Terrain,
-			MeshProbe.model}
+		local filter = {info.model, main, Render.layers.tint.model, Workspace.Terrain}
+		if MeshProbe.model then
+			filter[#filter + 1] = MeshProbe.model
+		end
+		if Silhouette.holder then
+			filter[#filter + 1] = Silhouette.holder
+		end
+		shadeParams.FilterDescendantsInstances = filter
 		local members = info.members
 		local n = #members
 		if n == 0 then
@@ -3766,26 +3798,46 @@ do
 		for _ = 1, min(n, PER_FRAME) do
 			cursor = cursor % n + 1
 			local st = members[cursor]
-			st.shaded = st.shadeKind ~= nil and not st.dead and st.isReceiver and (st.ltmLevel or 0) == 0
-				and Light.valid and inShadow(st)
+			st.shaded = st.shadeKind ~= nil and not st.polyReceive and not st.dead and st.isReceiver
+				and (st.ltmLevel or 0) == 0 and Light.valid and inShadow(st)
 		end
 		info.shadeCursor = cursor
-		-- every frame: the copies of shaded parts follow them
+		local push = 0.02 + (info.dist or 0) * 0.0005
+		local away = Light.dir * -push
+		-- every frame: the copies follow their parts
 		for i = 1, n do
 			local st = members[i]
 			local copy = st.shadeCopy
-			if st.shaded and st.shadeKind and (st.ltmLevel or 0) == 0 then
+			local mode = nil
+			if st.shadeKind and not st.dead and st.isReceiver and (st.ltmLevel or 0) == 0 and Light.valid then
+				if st.shaded then
+					mode = "whole"
+				elseif CONFIG.ShadeBackFaces then
+					mode = "dark"
+				end
+			end
+			if mode then
 				if copy == nil then
 					copy = makeCopy(st) or false
 					st.shadeCopy = copy
 				end
 				if copy then
 					local part = st.part
-					local want = part.Size + V3(GROW * 2, GROW * 2, GROW * 2)
-					if copy.Size ~= want then
-						copy.Size = want
+					local size, cf, scale = part.Size, part.CFrame, 1
+					if mode == "whole" then
+						size += V3(GROW * 2, GROW * 2, GROW * 2)
+						scale = 1.03
+					else
+						cf += away
 					end
-					copy.CFrame = part.CFrame
+					if copy.Size ~= size then
+						copy.Size = size
+					end
+					copy.CFrame = cf
+					local mesh = st.copyMesh
+					if mesh and mesh.Scale.X ~= scale then
+						mesh.Scale = V3(scale, scale, scale)
+					end
 					if copy.Parent ~= main then
 						copy.Parent = main
 					end
@@ -3813,6 +3865,331 @@ do
 		if copy then
 			pcall(copy.Destroy, copy)
 		end
+	end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Exact character silhouettes. A black copy of the character is drawn, as seen from the light, in
+-- a ViewportFrame on a SurfaceGui lying on the floor under it, stretched along the light so every
+-- point lands exactly where its shadow falls: hair spikes, hats, clothing, tools, everything.
+-- It's used whenever the character's whole shadow lies on one flat, lit block face (which is most
+-- of the time); anywhere else (edges, stairs, inside other shadows) the character casts polygons.
+----------------------------------------------------------------------------------------------------
+do
+	local floorParams = RaycastParams.new()
+	floorParams.FilterType = Enum.RaycastFilterType.Exclude
+	floorParams.IgnoreWater = true
+	local litParams = RaycastParams.new()
+	litParams.FilterType = Enum.RaycastFilterType.Exclude
+	litParams.IgnoreWater = true
+	local THICK = 0.02
+	local ROOM = 0.4       -- studs of room around the shadow
+	local CORNERS = {}
+	for x = -1, 1, 2 do
+		for y = -1, 1, 2 do
+			for z = -1, 1, 2 do
+				CORNERS[#CORNERS + 1] = V3(x, y, z) * 0.5
+			end
+		end
+	end
+
+	local function holderModel()
+		local h = Silhouette.holder
+		if h == nil or h.Parent == nil then
+			h = Instance.new("Model")
+			h.Name = SILHOUETTE_NAME
+			h.Parent = Workspace
+			Silhouette.holder = h
+		end
+		return h
+	end
+
+	local function filterList(info)
+		local list = {info.model, Render.layers.main.model, Render.layers.tint.model, holderModel()}
+		if MeshProbe.model then
+			list[#list + 1] = MeshProbe.model
+		end
+		return list
+	end
+
+	local function newView()
+		local canvas = Instance.new("Part")
+		canvas.Name = "SilhouetteCanvas"
+		canvas.Anchored = true
+		canvas.CanCollide = false
+		canvas.CanQuery = false
+		canvas.CanTouch = false
+		canvas.CastShadow = false
+		canvas.Transparency = 1
+		canvas.Size = V3(1, 1, THICK)
+		local gui = Instance.new("SurfaceGui")
+		gui.Name = SILHOUETTE_GUI
+		gui.Face = Enum.NormalId.Front
+		gui.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+		gui.CanvasSize = Vector2.new(256, 256)
+		gui.LightInfluence = 0
+		gui.AlwaysOnTop = false
+		gui.ClipsDescendants = true
+		gui.ResetOnSpawn = false
+		gui.Adornee = canvas
+		local vf = Instance.new("ViewportFrame")
+		vf.Size = UDim2.fromScale(1, 1)
+		vf.BackgroundTransparency = 1
+		vf.ImageColor3 = CONFIG.ShadowColor
+		vf.ImageTransparency = CONFIG.RenderStyle == "Direct" and CONFIG.DirectTransparency or CONFIG.ShadowTransparency
+		vf.Ambient = Color3.new(0, 0, 0)    -- no light at all inside: the copy draws black
+		vf.LightColor = Color3.new(0, 0, 0)
+		vf.Parent = gui
+		local world = Instance.new("WorldModel")
+		world.Parent = vf
+		local cam = Instance.new("Camera")
+		cam.Parent = vf
+		vf.CurrentCamera = cam
+		-- in the PlayerGui the copy stays out of the workspace; otherwise it rides on the canvas
+		local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		gui.Parent = playerGui or canvas
+		return {canvas = canvas, gui = gui, vf = vf, world = world, cam = cam, clones = {}, shown = false}
+	end
+
+	local function copyOf(st)
+		local part = st.part
+		if part:FindFirstChildOfClass("WrapLayer") then
+			return nil -- layered clothing only takes its shape on the body
+		end
+		local copy = nil
+		pcall(function()
+			local archivable = part.Archivable
+			part.Archivable = true
+			copy = part:Clone()
+			part.Archivable = archivable
+		end)
+		if not copy then
+			return nil
+		end
+		for _, child in ipairs(copy:GetChildren()) do
+			-- keep what gives it its shape (meshes) and its see-through cutouts (SurfaceAppearance)
+			if not (child:IsA("DataModelMesh") or child:IsA("SurfaceAppearance")) then
+				pcall(child.Destroy, child)
+			end
+		end
+		if st.charMesh then
+			local mesh = Instance.new("SpecialMesh")
+			mesh.MeshType = Enum.MeshType.FileMesh
+			mesh.MeshId = "rbxassetid://" .. tostring(st.charMesh)
+			mesh.Parent = copy
+		end
+		copy.Anchored = true
+		copy.CanCollide = false
+		copy.CanQuery = false
+		copy.CanTouch = false
+		copy.CastShadow = false
+		if copy.Material == Enum.Material.Neon then
+			copy.Material = Enum.Material.SmoothPlastic -- Neon would glow even in the dark
+		end
+		return copy
+	end
+
+	-- Does anything that casts a shadow sit between this floor point and the light?
+	local function shaded(origin)
+		local dir = Light.dir
+		local len = CONFIG.MaxShadowLength
+		for _ = 1, 4 do
+			local hit = Workspace:Raycast(origin, dir * len, litParams)
+			if not hit then
+				return false
+			end
+			local st = states[hit.Instance]
+			if st and st.isCaster and not st.dead and (st.ltmLevel or 0) < 2 then
+				return true
+			end
+			local step = hit.Distance + 0.05
+			len -= step
+			if len <= 0 then
+				return false
+			end
+			origin += dir * step
+		end
+		return false
+	end
+
+	local function isBlock(part)
+		return part.ClassName ~= "WedgePart" and part:IsA("Part") and part.Shape == Enum.PartType.Block
+			and part:FindFirstChildWhichIsA("DataModelMesh") == nil
+	end
+
+	function Silhouette.hide(info)
+		local view = info.sil
+		if view and view.shown then
+			view.shown = false
+			view.gui.Enabled = false
+			view.canvas.Parent = nil
+			for _, c in pairs(view.clones) do
+				if c then
+					c.Parent = nil
+				end
+			end
+		end
+	end
+
+	function Silhouette.hideAll()
+		for _, info in pairs(characters) do
+			Silhouette.hide(info)
+		end
+	end
+
+	function Silhouette.drop(info)
+		local view = info.sil
+		info.sil = nil
+		if view then
+			pcall(view.gui.Destroy, view.gui)
+			pcall(view.canvas.Destroy, view.canvas)
+		end
+	end
+
+	function Silhouette.destroyAll()
+		for _, info in pairs(characters) do
+			Silhouette.drop(info)
+		end
+		if Silhouette.holder then
+			pcall(Silhouette.holder.Destroy, Silhouette.holder)
+			Silhouette.holder = nil
+		end
+	end
+
+	-- Shows the silhouette when it fits. Returns the floor part it's drawn on, or nil.
+	function Silhouette.update(info, root)
+		if not CONFIG.ExactSilhouettes or not Light.valid or root == nil then
+			Silhouette.hide(info)
+			return nil
+		end
+		local filter = filterList(info)
+		floorParams.FilterDescendantsInstances = filter
+		litParams.FilterDescendantsInstances = filter
+		-- 1. the floor under the character: a still block
+		local hit = Workspace:Raycast(root.Position, V3(0, -60, 0), floorParams)
+		local floorPart = hit and hit.Instance
+		local fst = floorPart and states[floorPart]
+		if not fst or fst.dynamic or not fst.isReceiver or not isBlock(floorPart) then
+			Silhouette.hide(info)
+			return nil
+		end
+		local n = hit.Normal
+		local L = Light.L
+		local sinE = -L:Dot(n) -- how high the light stands above this floor
+		if sinE < 0.15 then
+			Silhouette.hide(info)
+			return nil
+		end
+		local flat = L + n * sinE
+		local cosE = flat.Magnitude
+		local u = cosE > 1e-4 and flat / cosE or (abs(n.Y) < 0.9 and YAXIS or XAXIS):Cross(n).Unit
+		local v = n:Cross(u)
+		-- 2. where the shadow falls: every visible part's box, pushed along the light onto the floor
+		local F = hit.Position
+		local umin, umax, vmin, vmax = huge, -huge, huge, -huge
+		local any = false
+		for _, st in ipairs(info.members) do
+			if st.isCaster and not st.dead and (st.ltmLevel or 0) < 2 then
+				any = true
+				local cf, size = st.part.CFrame, st.part.Size
+				for k = 1, 8 do
+					local P = cf * (CORNERS[k] * size)
+					local d = (P - F):Dot(n)
+					local S = P + L * (max(d, 0) / sinE)
+					local rel = S - F
+					local a, b = rel:Dot(u), rel:Dot(v)
+					umin, umax = min(umin, a), max(umax, a)
+					vmin, vmax = min(vmin, b), max(vmax, b)
+				end
+			end
+		end
+		if not any then
+			Silhouette.hide(info)
+			return nil
+		end
+		umin, umax, vmin, vmax = umin - ROOM, umax + ROOM, vmin - ROOM, vmax + ROOM
+		local W = max(vmax - vmin, (umax - umin) * sinE)
+		local Lu = W / sinE
+		local center = F + u * ((umin + umax) * 0.5) + v * ((vmin + vmax) * 0.5)
+		-- 3. the whole canvas has to lie on this face of the block, in the light
+		local fcf, half = floorPart.CFrame, floorPart.Size * 0.5
+		local ln = fcf:VectorToObjectSpace(n)
+		local an = abs(ln.X) > 0.999 and 1 or (abs(ln.Y) > 0.999 and 2 or (abs(ln.Z) > 0.999 and 3 or 0))
+		if an == 0 then
+			Silhouette.hide(info)
+			return nil
+		end
+		local du, dv = u * (Lu * 0.5), v * (W * 0.5)
+		for k = 0, 8 do
+			local su, sv = (k % 3) - 1, floor(k / 3) - 1
+			local c = center + du * su + dv * sv
+			local lp = fcf:PointToObjectSpace(c)
+			if (an ~= 1 and abs(lp.X) > half.X + 0.01) or (an ~= 2 and abs(lp.Y) > half.Y + 0.01)
+				or (an ~= 3 and abs(lp.Z) > half.Z + 0.01) then
+				Silhouette.hide(info)
+				return nil
+			end
+			if shaded(c + n * 0.05) then
+				Silhouette.hide(info)
+				return nil
+			end
+		end
+		-- 4. show it
+		local view = info.sil
+		if not view then
+			view = newView()
+			info.sil = view
+		end
+		local clones = view.clones
+		for _, st in ipairs(info.members) do
+			local c = clones[st]
+			if st.isCaster and not st.dead and (st.ltmLevel or 0) < 2 then
+				if c == nil then
+					c = copyOf(st) or false
+					clones[st] = c
+				end
+				if c then
+					local part = st.part
+					if c.Size ~= part.Size then
+						c.Size = part.Size
+					end
+					c.CFrame = part.CFrame
+					if c.Parent ~= view.world then
+						c.Parent = view.world
+					end
+				end
+			elseif c then
+				c.Parent = nil
+			end
+		end
+		for st, c in pairs(clones) do
+			if st.dead then
+				if c then
+					pcall(c.Destroy, c)
+				end
+				clones[st] = nil
+			end
+		end
+		-- the camera looks along the light, framing exactly the canvas (tiny angle: nearly parallel)
+		local dist = W * 45
+		local up = u * sinE + n * cosE
+		view.cam.CFrame = CFrame.fromMatrix(center - L * dist, v, -up)
+		view.cam.FieldOfView = math.deg(2 * math.atan(W * 0.5 / dist))
+		-- the canvas: its front face lies on the floor; across it runs v, along it runs u
+		local px = math.clamp(math.floor(W * 40 + 0.5), 96, 512)
+		if view.gui.CanvasSize.X ~= px then
+			view.gui.CanvasSize = Vector2.new(px, px)
+		end
+		view.canvas.Size = V3(W, Lu, THICK)
+		view.canvas.CFrame = CFrame.fromMatrix(center + n * (CONFIG.SurfaceOffset - THICK * 0.5), -v, -u)
+		if holdHidden then
+			Silhouette.hide(info) -- the start-up pause shows everything at once afterwards
+		elseif not view.shown then
+			view.shown = true
+			view.canvas.Parent = holderModel()
+			view.gui.Enabled = true
+		end
+		return floorPart
 	end
 end
 
@@ -3988,7 +4365,8 @@ do
 		end
 		local parent = part.Parent
 		local main, tint = Render.layers.main, Render.layers.tint
-		if parent == nil or parent == main.model or parent == tint.model or (parent == MeshProbe.model and parent ~= nil) then
+		if parent == nil or parent == main.model or parent == tint.model or (parent == MeshProbe.model and parent ~= nil)
+			or (Silhouette.holder ~= nil and part:IsDescendantOf(Silhouette.holder)) then
 			return
 		end
 		if not part:IsDescendantOf(Workspace) then
@@ -4084,6 +4462,7 @@ do
 				info.casterRec = nil
 				dropRecord(info.recvRec)
 				info.recvRec = nil
+				Silhouette.drop(info)
 				characters[info.model] = nil
 			end
 		end
@@ -4670,13 +5049,26 @@ do
 		if nc > 1 then
 			tsort(CHAR_LIST, distLess)
 		end
-		local casting, receiving = 0, 0
+		local casting, receiving, silhouettes = 0, 0, 0
 		for i = 1, nc do
 			local info = CHAR_LIST[i]
 			local lod = info.dist < CONFIG.NearDetail and 1 or 2
 			local inBudget = i == 1 or clock() < deadline
 			-- a character standing perfectly still keeps its shadows (animated ones always move)
 			local moved = characterMoved(info)
+			-- its exact silhouette on the floor, when that fits (the polygons then skip that floor)
+			local silFloor = nil
+			if CONFIG.ExactSilhouettes and CONFIG.CharacterShadows and silhouettes < CONFIG.MaxSilhouettes
+				and info.dist <= CONFIG.ReceiverDistance then
+				silhouettes += 1
+				silFloor = safeCall(Silhouette.update, info, characterRoot(info))
+			else
+				Silhouette.hide(info)
+			end
+			if silFloor ~= info.silFloor then
+				info.silFloor = silFloor
+				moved = true
+			end
 			if CONFIG.CharacterShadows and casting < CONFIG.MaxCharacters and info.dist <= CONFIG.DynamicDistance then
 				casting += 1
 				local rec = info.casterRec
@@ -4802,6 +5194,7 @@ do
 		processMeshReady()
 		processProbeReady()
 		if not enabled then
+			Silhouette.hideAll()
 			return true
 		end
 
@@ -4827,6 +5220,7 @@ do
 		end
 		Render.setVisible(Light.valid)
 		if not Light.valid then
+			Silhouette.hideAll()
 			return true
 		end
 
@@ -4873,6 +5267,9 @@ local function setEnabled(on)
 	end
 	enabled = on
 	Render.setVisible(on and Light.valid)
+	if not on then
+		Silhouette.hideAll()
+	end
 	if started then -- before that, the start-up pause swaps the shadows over when it's done
 		applyRobloxShadows(on)
 	end
@@ -4897,6 +5294,7 @@ local function shutdown()
 			end)
 		end
 	end
+	pcall(Silhouette.destroyAll)
 	pcall(Render.destroyAll)
 	if CONFIG.DisableRobloxShadows then
 		pcall(function()
@@ -4944,7 +5342,8 @@ local function onDescendantAdded(inst)
 	end
 	local parent = inst.Parent
 	local main, tint = Render.layers.main, Render.layers.tint
-	if parent == main.model or parent == tint.model or (parent ~= nil and parent == MeshProbe.model) then
+	if parent == main.model or parent == tint.model or (parent ~= nil and parent == MeshProbe.model)
+		or (Silhouette.holder ~= nil and inst:IsDescendantOf(Silhouette.holder)) then
 		return
 	end
 	if inst:IsA("BasePart") then
