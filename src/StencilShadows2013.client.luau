@@ -163,6 +163,7 @@ local TINT_CONTAINER_NAME = "__StencilShadowsTinted"
 local PROBE_NAME = "__StencilShadowsProbe"
 local SILHOUETTE_NAME = "__StencilShadowsSilhouettes"
 local LIT_CONTAINER_NAME = "__StencilShadowsLampRing"
+local ROUND_CONTAINER_NAME = "__StencilShadowsRound"
 local SILHOUETTE_GUI = "StencilSilhouette"
 local SAVED_SHADOWS_ATTR = "StencilShadowsSavedGlobalShadows"
 
@@ -171,7 +172,9 @@ local MIN_LIT = 0.02       -- a face must face the light at least this much (cos
 local MIN_AREA = 4e-4      -- shadow pieces smaller than this (studs^2) are dropped
 local MARGIN = 0.25        -- studs added around spatial queries
 local TERRAIN_OFFSET = 0.12
-local WEDGE_THICKNESS = 0.01
+-- Shadow pieces drawn as parts are this thick. Drawn as plain see-through parts ("Direct"), their
+-- sides would show as faint lines along every seam, so there they're as thin as Roblox allows.
+local WEDGE_THICKNESS = CONFIG.RenderStyle == "Direct" and 0.001 or 0.01
 
 ----------------------------------------------------------------------------------------------------
 -- Stop a previous copy of this script (or the older SurfaceGui engine) if one is running
@@ -205,7 +208,7 @@ do
 	for _, child in ipairs(Workspace:GetChildren()) do
 		local name = child.Name
 		if name == CONTAINER_NAME or name == TINT_CONTAINER_NAME or name == PROBE_NAME or name == SILHOUETTE_NAME
-			or name == LIT_CONTAINER_NAME
+			or name == LIT_CONTAINER_NAME or name == ROUND_CONTAINER_NAME
 			or name == "__StencilShadowReceivers" then
 			pcall(child.Destroy, child)
 		end
@@ -239,7 +242,8 @@ local holdHidden = false       -- shadows stay hidden while the start-up pause b
 local started = false          -- the start-up pause is over
 local newCharacter = false     -- a character appeared since the last character refresh
 
-local stats = {parts = 0, records = 0, pages = 0, wedges = 0, meshLoads = 0, frameMs = 0, backend = "Parts", loadPauseMs = 0}
+local stats = {parts = 0, records = 0, pages = 0, wedges = 0, meshLoads = 0, frameMs = 0, backend = "Parts", loadPauseMs = 0,
+	builds = 0}
 
 -- Functions shared between sections. Each section below is its own do-block so the script stays
 -- far below Luau's limit of 200 locals per function.
@@ -1308,7 +1312,7 @@ do
 	-- Facets around a cylinder between two half-ellipsoid ends, along the X or Y axis: a capsule
 	-- (round ends) or the classic head (flatter ends). half: half the straight middle, r: radius,
 	-- depth: how far each end sticks out past the middle.
-	local function cappedShell(axisName, half, r, depth, m, mrel)
+	local function cappedShell(axisName, half, r, depth, m, mrel, turn, tag)
 		local kh = max(1, ceil(m / 4))
 		local p = (1 + mrel) / sphereClearance(m, kh * 2)
 		local rings = {}
@@ -1327,8 +1331,13 @@ do
 			axis, e1, e2 = XAXIS, YAXIS, ZAXIS
 			endInv = V3(1 / (depth * depth), 1 / (r * r), 1 / (r * r))
 		end
+		if turn then
+			-- turn the facets around the axis (so one faces straight ahead, another straight back)
+			local c0, s0 = cos(turn), sin(turn)
+			e1, e2 = e1 * c0 + e2 * s0, e2 * c0 - e1 * s0
+		end
 		local faces = {}
-		latheShell(axis, e1, e2, rings, m, nil, faces)
+		latheShell(axis, e1, e2, rings, m, nil, faces, tag)
 		local terms = {
 			{c = axis * half, rinv2 = endInv},
 			{c = axis * -half, rinv2 = endInv},
@@ -1377,6 +1386,27 @@ do
 		local segs = outlineSegments(lod)
 		local r, depth = max(diameter * 0.49, 1e-3), max(height * 0.3, 1e-3)
 		local half = max(height * 0.5 - depth, 0)
+		if BLOCKY then
+			-- The old head mesh: 16 flat sides and rounded ends in four rows, each facet dark or lit
+			-- as a whole - by the same rule as the body's faces (one side faces straight ahead, like
+			-- the torso's front), so the face goes dark exactly when the chest does, and the
+			-- rounded top ends in steps (as old screenshots show).
+			return cached(string.format("HB%.3f,%.3f/%d", height, diameter, segs), offset, function()
+				local faces = cappedShell("Y", half, r, depth, CLASSIC_SIDES, max(0.004, 0.012 / r),
+					-pi / CLASSIC_SIDES, function(f)
+						f.cn = f.n
+					end)
+				return {
+					kind = "round",
+					segs = segs,
+					shade = true,
+					blocky = true,
+					ellipsoids = {ellipsoidAt(V3(0, half, 0), V3(r, depth, r)), ellipsoidAt(V3(0, -half, 0), V3(r, depth, r))},
+					faces = faces,
+					radius = max(r, height * 0.5) * 1.42,
+				}
+			end)
+		end
 		local m, mrel = surfaceSegments(max(r, depth), min(r, depth), lod, true)
 		return cached(string.format("H%.3f,%.3f/%d/%d", height, diameter, segs, m), offset, function()
 			local faces, terms = cappedShell("Y", half, r, depth, m, mrel)
@@ -2022,8 +2052,9 @@ do
 		if name == "Head" then
 			local mesh = part:FindFirstChildWhichIsA("DataModelMesh")
 			if mesh and mesh:IsA("SpecialMesh") and mesh.MeshType == Enum.MeshType.Head then
-				-- shadows land on it as polygons; its dark side comes from a copy (see BodyShade)
-				state.shadeKind = "part"
+				-- shadows land on it as polygons; its dark side is its facets (blocky), or a copy of
+				-- it (see BodyShade)
+				state.shadeKind = (CONFIG.RoundShading ~= "Blocky") and "part" or nil
 				state.polyReceive = true
 				local scale = mesh.Scale
 				return Shapes.classicHead(size.Y * scale.Y, min(size.X, size.Y, size.Z) * scale.X, lod, mesh.Offset)
@@ -2439,7 +2470,7 @@ end
 ----------------------------------------------------------------------------------------------------
 -- Output: the shadow polygons produced by one job (world space)
 ----------------------------------------------------------------------------------------------------
-local Lamps = {active = false, rec = nil}
+local Lamps = {active = false, rec = nil, version = 0}
 local Out = {pts = {}, sizes = {}, tints = {}, np = 0, nPoly = 0, cores = {}, nCores = 0}
 
 do
@@ -2483,14 +2514,36 @@ do
 	emitPlain = emitRaw
 
 	function emitFace(wf, xs, ys, n, tint)
-		if Lamps.active and not tint and Lamps.carve(wf, xs, ys, n, emitRaw) then
+		if Lamps.active and (not tint or tint == "round") and Lamps.carve(wf, xs, ys, n, emitRaw, tint) then
 			return -- lamps light some of it up (see Lamps)
 		end
 		emitRaw(wf, xs, ys, n, tint)
 	end
 
 	-- A world-space polygon, wound so its front faces `normal`.
+	local TWX, TWY, TWF = {}, {}, {o = ZERO, n = YAXIS, u = XAXIS, v = ZAXIS, lift = 0}
 	function emitWorld(poly, n, normal, tint)
+		if Lamps.active and not tint and n >= 3 then
+			-- (a terrain piece: lamps light it up like any face)
+			local o = poly[1]
+			local u = (poly[2] - o)
+			u -= normal * u:Dot(normal)
+			if u.Magnitude > 1e-6 then
+				u = u.Unit
+				local v = normal:Cross(u)
+				for i = 1, n do
+					local d = poly[i] - o
+					TWX[i], TWY[i] = d:Dot(u), d:Dot(v)
+				end
+				if polyArea(TWX, TWY, n) < 0 then
+					reversePoly(TWX, TWY, n)
+				end
+				TWF.o, TWF.n, TWF.u, TWF.v = o, normal, u, v
+				if Lamps.carve(TWF, TWX, TWY, n, emitRaw, false) then
+					return
+				end
+			end
+		end
 		local nx, ny, nz = 0, 0, 0
 		for i = 1, n do
 			local p, q = poly[i], poly[i % n + 1]
@@ -3591,7 +3644,7 @@ do
 		releaseMesh(rec)
 		local nPoly = out.nPoly
 		local pts, sizes, tints = out.pts, out.sizes, out.tints
-		local mainPolys, tintPolys, tintColors, dimPolys = {}, nil, nil, nil
+		local mainPolys, tintPolys, tintColors, dimPolys, roundPolys = {}, nil, nil, nil, nil
 		commitRec, commitPool = rec, pool
 		table.clear(fallbackPts)
 		table.clear(fallbackPolys)
@@ -3600,11 +3653,15 @@ do
 		for p = 1, nPoly do
 			local k = sizes[p]
 			local tint = tints[p]
-			if tint == "dim" then
+			if tint == "round" and Render.layers.round then
+				roundPolys = roundPolys or {}
+				roundPolys[#roundPolys + 1] = s
+				roundPolys[#roundPolys + 1] = k
+			elseif tint == "dim" then
 				dimPolys = dimPolys or {}
 				dimPolys[#dimPolys + 1] = s
 				dimPolys[#dimPolys + 1] = k
-			elseif tint then
+			elseif tint and tint ~= "round" then
 				tintPolys = tintPolys or {}
 				tintColors = tintColors or {}
 				tintPolys[#tintPolys + 1] = s
@@ -3633,7 +3690,10 @@ do
 		if Render.layers.dim then
 			commitParts(rec, Render.layers.dim, pts, dimPolys or NO_POLYS, nil)
 		end
-		commitCores(rec, Render.layers.main, out)
+		if Render.layers.round then
+			commitParts(rec, Render.layers.round, pts, roundPolys or NO_POLYS, nil)
+		end
+		commitCores(rec, Render.layers.round or Render.layers.main, out)
 		commitRec = nil
 	end
 
@@ -3668,6 +3728,16 @@ do
 		end
 	end
 
+	-- Is this one of the shadow models' own instances (shadow pieces, copies, cores)?
+	function Render.owns(inst)
+		for _, layer in pairs(Render.layers) do
+			if inst:IsDescendantOf(layer.model) then
+				return true
+			end
+		end
+		return false
+	end
+
 	-- A copy of an avatar part, darkened by the Highlight like any shadow (see BodyShade).
 	function Render.styleShade(part)
 		styleShadowPart(part, Render.layers.main)
@@ -3689,6 +3759,10 @@ do
 			Enum.Material.Neon, CONFIG.ShadowColor)
 		makeLayer("tint", TINT_CONTAINER_NAME, false, CONFIG.TransparentShadowTransparency,
 			Enum.Material.SmoothPlastic, Color3.new(0.5, 0.5, 0.5))
+		if direct and CONFIG.RoundShading == "Blocky" then
+			-- Direct style: balls' dark sides (drawn with parts) under a Highlight of their own
+			makeLayer("round", ROUND_CONTAINER_NAME, true, 0.999, Enum.Material.Neon, CONFIG.ShadowColor)
+		end
 		if CONFIG.DynamicLights then
 			-- the lighter ring around a lamp's light: half as dark as a shadow
 			local layer = makeLayer("dim", LIT_CONTAINER_NAME, not direct,
@@ -3836,8 +3910,11 @@ do
 	local function emitBlocky(state, shape, faces, rec)
 		local cf = state.part.CFrame
 		local dl = cf:VectorToObjectSpace(Light.dir)
+		-- (Direct style drawn with parts: a ball's dark side goes into its own small Highlight layer,
+		-- so the ball-shaped middle can be used - about 300 parts a tree top instead of 750)
+		local layer = Render.layers.round ~= nil and not Render.meshOk and "round" or false
 		local core, a, reach = shape.core, -dl, nil
-		if core and CONFIG.RenderStyle ~= "Direct" then
+		if core and (CONFIG.RenderStyle ~= "Direct" or layer) and not (Lamps.active and Lamps.lights(cf * core.c, state.part)) then
 			local nearest = pi
 			for _, cell in ipairs(shape.cells) do
 				if cell.n:Dot(dl) >= MIN_LIT then
@@ -3861,7 +3938,7 @@ do
 			if cn then
 				if cn:Dot(dl) < MIN_LIT then
 					if not (reach and reach > lf.cr and lf.cd:Dot(a) > cos(reach - lf.cr)) then
-						emitFace(wf, lf.xs, lf.ys, lf.count, false)
+						emitFace(wf, lf.xs, lf.ys, lf.count, layer)
 					end
 				elseif wf.s < MIN_LIT and rec and not state.dynamic then
 					-- a lit classic facet where the real curve already turns from the light: shadows
@@ -3873,7 +3950,7 @@ do
 					end
 					local blocker = sunBlocker(wf.o + wf.n * 0.05)
 					if blocker then
-						emitFace(wf, lf.xs, lf.ys, lf.count, false)
+						emitFace(wf, lf.xs, lf.ys, lf.count, layer)
 						-- redraw when that blocker moves or goes
 						local deps = blocker.dependents
 						if not deps then
@@ -3965,8 +4042,12 @@ do
 	local DIRECT = CONFIG.RenderStyle == "Direct"
 	local UX, UY, VX, VY = {}, {}, {}, {}
 	local PLANES = {}          -- this record's polygons so far, per plane (cleared per record)
+	local coverLodDep = false  -- a round caster cut into this record's shadows
 	local function ALWAYS_FIRST()
 		return true
+	end
+	local function NEVER_FIRST()
+		return false
 	end
 
 	-- Polygons Out holds from index `from` on, taken back out, in the face's 2D coordinates:
@@ -4063,10 +4144,27 @@ do
 					local g = getGeom(c, cshape, lod)
 					if g.hullCount >= 3 and g.maxX >= x0 and g.minX <= x1 and g.maxY >= y0 and g.minY <= y1
 						and lightOverlap(g, wf) then
-						local mark = Out.nPoly + 1
-						castOnFace(g, wf)
-						if Out.nPoly >= mark then
-							for _, pc in ipairs(takeOut(wf, mark)) do
+						-- its polygons on this face, worked out once per light / position
+						local cache = c.coverCache
+						if not cache then
+							cache = setmetatable({}, {__mode = "k"})
+							c.coverCache = cache
+						end
+						local entry = cache[wf]
+						local rcf = receiver and receiver.cfVersion or 0
+						if not (entry and entry.light == Light.version and entry.ccf == c.cfVersion and entry.rcf == rcf
+							and entry.lod == lod and entry.lamps == Lamps.version) then
+							local mark = Out.nPoly + 1
+							castOnFace(g, wf)
+							entry = {light = Light.version, ccf = c.cfVersion, rcf = rcf, lod = lod, lamps = Lamps.version,
+								polys = Out.nPoly >= mark and takeOut(wf, mark) or {}}
+							cache[wf] = entry
+						end
+						if cshape.kind == "round" or cshape.blocky then
+							coverLodDep = true -- (its outline changes with detail: so does this cut)
+						end
+						if #entry.polys > 0 then
+							for _, pc in ipairs(entry.polys) do
 								cover[#cover + 1] = pc
 							end
 							if rec then
@@ -4148,6 +4246,7 @@ do
 		if pending then
 			return false
 		end
+		stats.builds += 1
 		local rec = state.casterRec
 		if not rec then
 			rec = newRecord(state, "static")
@@ -4156,7 +4255,10 @@ do
 		unlinkReceivers(rec)
 		resetOut()
 		table.clear(PLANES)
+		coverLodDep = false
 		Lamps.rec = rec
+		-- does anything here change with the level of detail? (round parts, meshes, terrain)
+		local lodDep = shape ~= nil and (shape.kind == "round" or shape.blocky == true or shape.tris ~= nil)
 		if shape and state.isCaster and Light.valid then
 			local g = getGeom(state, shape, lod)
 			if g.hullCount >= 3 then
@@ -4171,6 +4273,9 @@ do
 					local r = states[parts[i]]
 					if r and r ~= state and r.isReceiver and not r.dynamic then
 						local rshape = getShape(r, lod)
+						if rshape and (rshape.kind == "round" or rshape.blocky) then
+							lodDep = true
+						end
 						if rshape and rshape.faces then
 							local before = Out.nPoly
 							local faces = getWorldFaces(r, rshape)
@@ -4200,6 +4305,7 @@ do
 					end
 				end
 				if terrainPresent and CONFIG.TerrainShadows then
+					lodDep = true
 					GEOMS[1] = g
 					drapeOnTerrain(GEOMS, 1, g.minX, g.maxX, g.minY, g.maxY, g.minZ, g.maxZ, lod)
 					GEOMS[1] = nil
@@ -4210,6 +4316,7 @@ do
 			end
 		end
 		Lamps.rec = nil
+		rec.lodDep = lodDep or coverLodDep
 		Render.commit(rec, Out, "static")
 		rec.lightVersion = Light.version
 		rec.lod = lod
@@ -4311,6 +4418,7 @@ do
 			owner.recvRec = rec
 		end
 		resetOut()
+		table.clear(PLANES)
 		if Light.valid and not owner.fullShade then -- (a whole shaded character has one Highlight)
 			local nr = 0
 			local minX, maxX, minY, maxY, minZ, maxZ = huge, -huge, huge, -huge, huge, -huge
@@ -4336,6 +4444,7 @@ do
 			if nr > 0 then
 				local parts = queryBox(minX - MARGIN, maxX + MARGIN, minY - MARGIN, maxY + MARGIN,
 					minZ - CONFIG.MaxShadowLength, maxZ + MARGIN)
+				local casters, geoms = {}, {}
 				for i = 1, #parts do
 					local c = states[parts[i]]
 					if c and c.isCaster and not c.dead then
@@ -4343,18 +4452,28 @@ do
 						if cshape then
 							local g = getGeom(c, cshape, lod)
 							if g.hullCount >= 3 then
-								for k = 1, nr do
-									local st = RECV[k]
-									if st ~= c and not wrapsAround(c, st) then
-										local faces = st.wf
-										for f = 1, #faces do
-											local wf = faces[f]
-											if wf.s > MIN_LIT and lightOverlap(g, wf) then
-												castOnFace(g, wf)
-											end
-										end
-									end
+								casters[#casters + 1] = c
+								geoms[#geoms + 1] = g
+							end
+						end
+					end
+				end
+				-- face by face, so the shadows landing on one face can be kept from stacking
+				for k = 1, nr do
+					local st = RECV[k]
+					local faces = st.wf
+					for f = 1, #faces do
+						local wf = faces[f]
+						if wf.s > MIN_LIT then
+							local from = Out.nPoly + 1
+							for i = 1, #casters do
+								local c = casters[i]
+								if c ~= st and not wrapsAround(c, st) and lightOverlap(geoms[i], wf) then
+									castOnFace(geoms[i], wf)
 								end
+							end
+							if DIRECT and Out.nPoly > from then
+								unstack(wf, from, st, NEVER_FIRST, lod, nil)
 							end
 						end
 					end
@@ -4474,7 +4593,7 @@ do
 
 	-- Every few frames: which lamps shine, and has any of them changed?
 	function Lamps.refresh(now)
-		if not CONFIG.DynamicLights or now - lastRefresh < 0.1 then
+		if not CONFIG.DynamicLights or now - lastRefresh < 0.25 then
 			return
 		end
 		lastRefresh = now
@@ -4507,6 +4626,7 @@ do
 						lamp.pos = nil
 					end
 					lamp.shines = info ~= nil
+					Lamps.version += 1
 				end
 				if lamp.shines then
 					active[#active + 1] = lamp
@@ -4575,7 +4695,7 @@ do
 				CX[m], CY[m] = d:Dot(u), d:Dot(v)
 			end
 		end
-		if dir:Dot(nrm) > 0.05 and not lamp.corners then
+		if dir:Dot(nrm) > 0.05 then
 			return 0 -- shining away from this plane
 		end
 		-- keep the part of the disc inside the cone's footprint (its convex hull)
@@ -4805,7 +4925,7 @@ do
 	-- Called for every shadow polygon (in a face's 2D coordinates). Returns true when lamps change
 	-- it (the pieces are emitted here), false to draw it as it is.
 	local OX, OY, IX, IY, QSX, QSY, TX, TY = {}, {}, {}, {}, {}, {}, {}, {}
-	function Lamps.carve(wf, xs, ys, n, emit)
+	function Lamps.carve(wf, xs, ys, n, emit, baseLayer)
 		local o, nrm, u, v = wf.o, wf.n, wf.u, wf.v
 		local mine = nil
 		for _, lamp in ipairs(active) do
@@ -4832,7 +4952,7 @@ do
 			return false
 		end
 		local pieces = {copyPoly(xs, ys, n)}
-		pieces[1][4] = false
+		pieces[1][4] = baseLayer or false
 		for _, lamp in ipairs(mine) do
 			local on = poolOn(lamp, o, nrm, u, v, poolRange(lamp, true), OX, OY)
 			if on >= 3 then
@@ -4881,9 +5001,20 @@ do
 								nextPieces[#nextPieces + 1] = piece
 							end
 						end
-						-- the fading ring: a lighter shadow
+						-- the fading ring: a lighter shadow (not where a lamp shadow already is)
 						if CONFIG.LightFade and inner >= 3 then
-							subtract(TX, TY, inn, IX, IY, inner, "dim", nextPieces)
+							local ring = {}
+							subtract(TX, TY, inn, IX, IY, inner, "dim", ring)
+							for _, sp in ipairs(shadows) do
+								local cut = {}
+								for _, rp in ipairs(ring) do
+									subtract(rp[1], rp[2], rp[3], sp[1], sp[2], sp[3], "dim", cut)
+								end
+								ring = cut
+							end
+							for _, rp in ipairs(ring) do
+								nextPieces[#nextPieces + 1] = rp
+							end
 						end
 					end
 				end
@@ -4952,12 +5083,9 @@ do
 		return false
 	end
 
-	-- In shadow when at least two of three points along the part are (and no lamp lights it).
+	-- In shadow when at least two of three points along the part are.
 	local function inShadow(st)
 		local part = st.part
-		if Lamps.active and Lamps.lights(part.Position, st.character) then
-			return false
-		end
 		local cf, size = part.CFrame, part.Size
 		local len = CONFIG.MaxShadowLength
 		local up = cf.UpVector * (size.Y * 0.3)
@@ -5114,7 +5242,9 @@ do
 			cursor = cursor % n + 1
 			local st = members[cursor]
 			if visibleMember(st) and Light.valid then
-				st.inShade = inShadow(st)
+				-- a lamp shining on it (2013 edition) lights it: no shade, no dark side
+				st.lampLit = Lamps.active and Lamps.lights(st.part.Position, st.character) or false
+				st.inShade = not st.lampLit and inShadow(st)
 			else
 				st.inShade = nil
 			end
@@ -5170,7 +5300,7 @@ do
 			if not full and st.shadeKind and visibleMember(st) and Light.valid then
 				if st.shaded then
 					mode = "whole"
-				elseif CONFIG.ShadeBackFaces then
+				elseif CONFIG.ShadeBackFaces and not st.lampLit then
 					mode = "dark"
 				end
 			end
@@ -5512,24 +5642,43 @@ do
 		local Lu = W / sinE
 		local center = F + u * ((umin + umax) * 0.5) + v * ((vmin + vmax) * 0.5)
 		-- 3. the floor has to carry on, flat, under the whole canvas (it may be many parts: tiles,
-		-- a baseplate in pieces), or the shadow would hang in the air past an edge
-		for k = 0, 15 do
-			local su, sv = (k % 4) / 3 - 0.5, floor(k / 4) / 3 - 0.5
-			local c = center + u * (Lu * su) + v * (W * sv)
-			local down = Workspace:Raycast(c + n * 0.3, n * -0.6, floorParams)
-			local dst = down and states[down.Instance]
-			if not down or abs(down.Distance - 0.3) > 0.03 or down.Normal:Dot(n) < 0.999 or not dst
-				or dst.dynamic or not dst.isReceiver then
-				Silhouette.hide(info)
-				return nil
+		-- a baseplate in pieces), or the shadow would hang in the air past an edge. (16 rays: only
+		-- redone when the shadow has moved a little, or every few frames)
+		local sup = info.silSupport
+		local now = clock()
+		if not sup or now - sup.t > 0.3 or (sup.center - center).Magnitude > 0.5 or abs(sup.W - W) > 0.15 * W
+			or abs(sup.Lu - Lu) > 0.15 * Lu or sup.n:Dot(n) < 0.9999 then
+			local ok = true
+			for k = 0, 15 do
+				local su, sv = (k % 4) / 3 - 0.5, floor(k / 4) / 3 - 0.5
+				local c = center + u * (Lu * su) + v * (W * sv)
+				local down = Workspace:Raycast(c + n * 0.3, n * -0.6, floorParams)
+				local dst = down and states[down.Instance]
+				if not down or abs(down.Distance - 0.3) > 0.03 or down.Normal:Dot(n) < 0.999 or not dst
+					or dst.dynamic or not dst.isReceiver then
+					ok = false
+					break
+				end
 			end
+			sup = {center = center, W = W, Lu = Lu, n = n, t = now, ok = ok}
+			info.silSupport = sup
+		end
+		if not sup.ok then
+			Silhouette.hide(info)
+			return nil
+		end
+		-- (2013 edition: where a lamp lights the floor, the shadow is taken away there - the
+		-- polygons can show that, the silhouette can't)
+		if Lamps.active and Lamps.lights(center + n * 0.1, info.model) then
+			Silhouette.hide(info)
+			return nil
 		end
 		-- 4. and mostly in the light: a silhouette inside another shadow would make it darker
 		-- (a few spots are re-checked each frame; it switches over with a margin, not back and forth)
 		local lit = info.silLit or {}
 		info.silLit = lit
 		local cursor = info.silCursor or 0
-		for _ = 1, min(ns, 6) do
+		for _ = 1, min(ns, 3) do
 			cursor = cursor % ns + 1
 			lit[cursor] = not shaded(spots[cursor] + n * 0.05)
 		end
@@ -5695,7 +5844,7 @@ do
 
 	-- Everything that drew a shadow on this part has to redraw.
 	markDependentsDirty = function(state)
-		if Lamps.active and not state.character then
+		if Lamps.active and not state.character and not state.dynamic then
 			Lamps.partMoved(state.part.Position)
 		end
 		local deps = state.dependents
@@ -5782,9 +5931,7 @@ do
 			return
 		end
 		local parent = part.Parent
-		local main, tint, dim = Render.layers.main, Render.layers.tint, Render.layers.dim
-		if parent == nil or part:IsDescendantOf(main.model) or parent == tint.model
-			or (dim ~= nil and parent == dim.model) or (parent == MeshProbe.model and parent ~= nil)
+		if parent == nil or Render.owns(part) or (parent == MeshProbe.model and parent ~= nil)
 			or (Silhouette.holder ~= nil and part:IsDescendantOf(Silhouette.holder)) then
 			return
 		end
@@ -6342,6 +6489,10 @@ do
 			return false
 		end
 		local rec = st.casterRec
+		if rec and rec.lod ~= ch.lod and rec.lodDep == false then
+			-- (blocks on blocks: the same shadows at any detail - nothing to redo walking around)
+			rec.lod = ch.lod
+		end
 		return st.dirty or rec == nil or rec.lightVersion ~= Light.version or rec.lod ~= ch.lod
 	end
 
@@ -6707,13 +6858,60 @@ end
 ----------------------------------------------------------------------------------------------------
 -- Toggle, Roblox shadows, API, start-up
 ----------------------------------------------------------------------------------------------------
+-- Lamps' own Roblox shadows (Shadows = true): they'd lie on top of the stencil shadows too.
+local lightShadows = setmetatable({}, {__mode = "k"})  -- Light -> its Shadows value before
+local robloxShadowsOff = false
+
+local watchedLights = setmetatable({}, {__mode = "k"})
+
+local function quietLight(light)
+	if not watchedLights[light] then
+		-- (a game script switching it back on gets switched off again)
+		watchedLights[light] = true
+		pcall(function()
+			light:GetPropertyChangedSignal("Shadows"):Connect(function()
+				if robloxShadowsOff and alive and light.Shadows then
+					lightShadows[light] = true
+					light.Shadows = false
+				end
+			end)
+		end)
+	end
+	if robloxShadowsOff then
+		local ok, was = pcall(function()
+			return light.Shadows
+		end)
+		if ok and was then
+			lightShadows[light] = true
+			pcall(function()
+				light.Shadows = false
+			end)
+		end
+	end
+end
+
 local function applyRobloxShadows(customOn)
 	if not CONFIG.DisableRobloxShadows then
 		return
 	end
+	robloxShadowsOff = customOn
 	pcall(function()
 		Lighting.GlobalShadows = (not customOn) and savedGlobalShadows
 	end)
+	if customOn then
+		for _, d in ipairs(Workspace:GetDescendants()) do
+			if d:IsA("Light") then
+				quietLight(d)
+			end
+		end
+	else
+		for light in pairs(lightShadows) do
+			pcall(function()
+				light.Shadows = true
+			end)
+		end
+		table.clear(lightShadows)
+	end
 end
 
 local function setEnabled(on)
@@ -6755,6 +6953,12 @@ local function shutdown()
 		pcall(function()
 			Lighting.GlobalShadows = savedGlobalShadows
 		end)
+		robloxShadowsOff = false
+		for light in pairs(lightShadows) do
+			pcall(function()
+				light.Shadows = true
+			end)
+		end
 	end
 	pcall(function()
 		Lighting:SetAttribute(SAVED_SHADOWS_ATTR, nil)
@@ -6796,13 +7000,16 @@ local function onDescendantAdded(inst)
 		return
 	end
 	local parent = inst.Parent
-	local main, tint, dim = Render.layers.main, Render.layers.tint, Render.layers.dim
-	if inst:IsDescendantOf(main.model) or parent == tint.model or (dim ~= nil and parent == dim.model)
-		or (parent ~= nil and parent == MeshProbe.model)
+	if Render.owns(inst) or (parent ~= nil and parent == MeshProbe.model)
 		or (Silhouette.holder ~= nil and inst:IsDescendantOf(Silhouette.holder)) then
 		return
 	end
-	if inst:IsA("BasePart") or (CONFIG.DynamicLights and inst:IsA("Light")) then
+	if inst:IsA("Light") then
+		quietLight(inst)
+		if CONFIG.DynamicLights then
+			qpush(addQ, inst)
+		end
+	elseif inst:IsA("BasePart") then
 		qpush(addQ, inst)
 	elseif inst:IsA("Humanoid") then
 		if parent then

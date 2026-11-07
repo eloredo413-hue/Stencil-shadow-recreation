@@ -32,9 +32,9 @@ There are two scripts. They are the same script with one setting changed:
   facets, so a tree top's dark side ended in steps, facet by facet. Here every one of those classic
   facets is dark or lit as a whole.
   - The steps are drawn on finer facets that hug the real ball, so nothing floats off its edge.
-  - In the Highlight style, the middle of a ball's dark side is one ball-shaped part. When drawing
-    with parts, a nearby size-8 tree top costs about 300 parts in the Highlight style and about
-    750 in the Direct style (where that ball-shaped part would overlap the facets).
+  - The middle of a ball's dark side is one ball-shaped part. When drawing with parts, a nearby
+    size-8 tree top costs about 300 parts. (In the Direct style that part and the facets sit under
+    a small Highlight of their own, so they can overlap.)
   - A ball's shadow on the ground has the classic facets' outline.
   - `RoundShading = "Smooth"` gives the smooth version instead.
 - **Characters cast their exact silhouette**, R6 and R15, with packages, hats, hair and tools.
@@ -49,9 +49,13 @@ There are two scripts. They are the same script with one setting changed:
   - Default blocky bodies (R6, and R15 with the default body) are real boxes and are drawn exactly.
 - **Shadows land on players too.**
   - Blocky bodies take exact shadows, and their sides away from the sun are dark.
-  - On package avatars, heads, hair and hats, each part has a copy of its real mesh that darkens
-    it. In the light, only the side facing away from the sun darkens, as inside the old shadow
-    volumes. Inside a shadow, the whole part darkens.
+  - The classic head shades like the old head mesh: 16 flat sides lined up with the body (one
+    faces straight ahead, like the torso's front) and rounded ends. Each facet is dark or lit by
+    the same rule as the body's faces, so the face goes dark exactly when the chest does, and the
+    rounded top ends in steps, as in old screenshots.
+  - On package avatars, other heads, hair and hats, each part has a copy of its real mesh that
+    darkens it. In the light, only the side facing away from the sun darkens, as inside the old
+    shadow volumes. Inside a shadow, the whole part darkens.
   - Dynamic heads keep their face bones in that copy, so it follows the face.
   - A character that is entirely in shade (indoors, under a roof) is darkened by one Highlight on
     the real avatar instead, so face, hair, hands and glasses all darken exactly.
@@ -65,9 +69,15 @@ There are two scripts. They are the same script with one setting changed:
   - Glowing (Neon) parts give off light, so shadows don't darken them.
 - **Smooth shadow edges.** Shadows are drawn as plain see-through geometry, which Roblox
   anti-aliases. Wherever two shadows would overlap on a surface, one is cut away, so nothing is ever
-  darker than one shadow. That includes a player's shadow over a building's shadow, and one shadow
-  across two floor tiles. The old way, one Highlight, is still there (`RenderStyle = "Highlight"`),
-  but Roblox draws Highlights without anti-aliasing, so their edges look jagged on phones.
+  darker than one shadow. That includes a player's shadow over a building's shadow, one shadow
+  across two floor tiles, and shadows from two things landing on a player. The pieces are as thin
+  as Roblox allows (0.001 studs), so their sides don't show as lines along the seams. The old way,
+  one Highlight, is still there (`RenderStyle = "Highlight"`), but Roblox draws Highlights without
+  anti-aliasing, so their edges look jagged on phones.
+- **Roblox's own shadows stay off.** `Lighting.GlobalShadows` goes off while the stencil shadows
+  are on, and so does `Shadows` on lamps (PointLight, SpotLight, SurfaceLight), so Roblox's soft
+  shadows never lie on top of these. If the game switches either back on, it goes off again. Key 9
+  (or removing the script) gives everything back.
 - **The whole map at once.** There is no loading screen. The game waits for your character, then
   freezes while the shadows are built, then all of them appear in the same frame that Roblox's own
   shadows switch off.
@@ -80,10 +90,17 @@ There are two scripts. They are the same script with one setting changed:
 - **Moving things update every frame**: characters, unanchored parts, vehicles (one shadow job per
   assembly) and tweened parts. A part that stops moving goes back into the map's shadows.
 - **Sun and moon.** Shadows follow the sun, or the moon at night. When neither is up they hide.
-- **Lamps (2013 edition).** Where a lamp shines strongly (`LightPoolSize` of its Range), the sun's
-  shadow is taken away, with a ring at half darkness around it (`LightFade`). Parts between the
-  lamp and a surface keep a full shadow there, pointing away from the lamp. Switching, moving or
-  changing a lamp redraws what it reaches.
+- **Lamps (2013 edition).** PointLights shine all around; SpotLights and SurfaceLights only inside
+  their cone (`Angle`, `Face`). Where a lamp shines strongly (`LightPoolSize` of its Range), the
+  sun's shadow is taken away, with a ring at half darkness around it (`LightFade`). Parts between
+  the lamp and a surface keep a full shadow there, pointing away from the lamp, and the ring
+  doesn't stack on it. The same goes for shadows on terrain, round parts' dark sides, and
+  characters: a player standing in a lamp's light gets no dark sides and no sun silhouette there.
+  Switching, moving or changing a lamp redraws what it reaches.
+- **Smooth while walking around.** Shadows that look the same at every level of detail (blocks on
+  blocks) aren't rebuilt when you walk closer or further away, still parts' shadows under a moving
+  player are worked out once instead of every frame, and the silhouette's floor check runs only
+  when the shadow has moved.
 - **Toggle** with 9. Turning it off hides the shadows and restores `Lighting.GlobalShadows`.
 
 ## Settings
@@ -189,8 +206,8 @@ What that means inside a building:
 - **Direct style.**
   - Shadows on terrain, and shadows from several parts landing on a character, can still overlap
     and look darker there.
-  - Balls cost more parts than with the Highlight style (about 750 instead of 300 for a nearby
-    tree top drawn with parts), because the ball-shaped middle would overlap the facets.
+  - Balls' dark sides use a small Highlight of their own (with parts), so their stepped edge isn't
+    anti-aliased.
   - Building takes about twice the CPU time, because overlaps are cut on the CPU.
 - **Highlight style.** Roblox draws at most 31 Highlights at once, and draws them without
   anti-aliasing ([DevForum feature request](https://devforum.roblox.com/t/anti-aliasing-for-highlight-instances/1862811)).
@@ -212,7 +229,8 @@ What that means inside a building:
   - Dynamic heads: Roblox's skinning wasn't available to test here. If a dynamic head's copy
     still doesn't draw, the whole-character Highlight still covers it in shade.
 - **Lamps (2013 edition).** Only still parts cast shadows from lamps (not players). A lamp's pool
-  is a disc or cone with one softer ring, not Roblox's exact falloff.
+  is a disc or cone with one softer ring, not Roblox's exact falloff. Lamps' own Roblox shadows
+  are switched off, since these replace them.
 - **Not tested in Roblox itself.** The requester tests each version in a real game on a phone. The
   fixes in this version were checked with the Luau parser, linter and simulation suite below.
 
@@ -221,7 +239,7 @@ What that means inside a building:
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 61 scenarios compare the shadow triangles it draws against independently computed projections.
+The 68 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover:
 
 - Every shape, clipping, parts sunk into the floor, shadows falling 450 studs.
@@ -231,13 +249,17 @@ They cover:
 - The exact silhouette (every body point's shadow lands at the same spot on the canvas and in the
   camera image), its fallbacks, and a floor made of two parts.
 - Hair not blacking out its own head, hair getting its own shading, dynamic heads keeping their
-  bones, and the one Highlight for a character entirely in shade.
+  bones, the one Highlight for a character entirely in shade, and the classic head's facets going
+  dark together with the torso's faces.
 - Blocky balls (each classic facet dark or lit as a whole, tight on the ball, the classic outline,
   dark all over under a roof), with EditableMesh and with parts.
-- The Direct style: no overlaps anywhere on the floor, across floor tiles and after a part moves,
-  and the same coverage as the Highlight style.
-- Lamps in the 2013 edition (lit pool, softer ring, a crate's shadow from the lamp, switching off),
-  and the classic script ignoring them.
+- The Direct style: no overlaps anywhere on the floor, across floor tiles, after a part moves, on
+  players, and between a lamp's ring and its shadows; the same coverage as the Highlight style;
+  0.001-stud pieces; balls with their ball-shaped middle.
+- Lamps in the 2013 edition (lit pool, softer ring, a crate's shadow from the lamp, switching off,
+  spot and surface lights lighting only their cone, a player in a lamp's light), the classic script
+  ignoring them, and lamps' own Roblox shadows switched off and back on with key 9.
+- Walking around a kept map: only shadows that depend on the level of detail are rebuilt.
 - The start-up pause, whole-map loading (far islands built before the pause ends, nothing loading
   while flying around), and huge maps still streaming.
 - The wedge-part fallback, exact concave meshes, ray-sampled meshes, terrain, sun, moon and night,
