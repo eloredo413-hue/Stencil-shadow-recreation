@@ -16,12 +16,12 @@
 	 * The meshes are 99.9% transparent. One Highlight (black fill at 0.6, no outline, Occluded)
 	   paints the whole shadow model in a single pass, so overlapping shadows never get darker
 	   than one shadow - which is exactly what made stencil shadows look the way they did.
-	 * If EditableMesh isn't allowed in the game, the same shadow triangles are drawn with thin
-	   wedge parts instead (same Highlight trick, same look).
+	 * If EditableMesh isn't allowed in the game, the same shadow shapes are drawn with thin wedge
+	   parts and blocks instead (same Highlight trick, same look).
 	 * Still parts are grouped into chunks around the camera and built nearest-first inside a
-	   per-frame time budget. Moving parts and characters are rebuilt every frame. Shadows also
-	   land on players and loose parts, drape over terrain, and the sides of parts that face away
-	   from the light are darkened as if they were inside the old shadow volumes.
+	   per-frame time budget. Moving parts, vehicles and characters are rebuilt whenever they move.
+	   Shadows also land on players and loose parts, drape over terrain, and the sides of parts
+	   that face away from the light are darkened as if they were inside the old shadow volumes.
 	 * Shadows follow the sun, and the moon at night.
 
 	 Other scripts can use _G.StencilShadows:  SetEnabled(bool), Toggle(), IsEnabled(),
@@ -59,6 +59,7 @@ local CONFIG = {
 
 	-- Range & detail ----------------------------------------------------------------------------
 	ShadowDistance = 520,                 -- map shadows are kept within this distance of the camera
+	PartsShadowDistance = 300,            -- the same when drawing with parts (no EditableMesh)
 	ChunkSize = 64,                       -- studs; map shadows load and unload per chunk
 	NearDetail = 140,                     -- full detail (smooth curves, exact mesh shadows) within this
 	MidDetail = 320,
@@ -82,7 +83,7 @@ local CONFIG = {
 	-- Moving things -----------------------------------------------------------------------------
 	DynamicDistance = 260,                -- moving parts and characters cast shadows within this range
 	MaxCharacters = 8,
-	MaxMovingShadows = 150,
+	MaxMovingShadows = 150,               -- moving objects with shadows (a whole vehicle counts once)
 	RestTime = 1.5,                       -- seconds a moved part must stay still to rejoin the map
 	ReceiverDistance = 120,               -- players / loose parts this close get shadows drawn on them
 	MaxCharacterReceivers = 3,
@@ -91,7 +92,7 @@ local CONFIG = {
 	-- Performance -------------------------------------------------------------------------------
 	FrameBudget = 4.2,                    -- milliseconds of work per frame
 	LoadingBudget = 9,                    -- milliseconds per frame while shadows are still loading
-	RegisterPerFrame = 2500,              -- parts scanned per frame at startup
+	RegisterPerFrame = 4000,              -- instances scanned per frame at startup (also time-limited)
 	PollPerFrame = 250,                   -- resting unanchored parts checked for movement per frame
 
 	-- Roblox's own shadows ----------------------------------------------------------------------
@@ -133,11 +134,21 @@ local WEDGE_THICKNESS = 0.01
 -- Stop a previous copy of this script (or the older SurfaceGui engine) if one is running
 ----------------------------------------------------------------------------------------------------
 do
-	for _, key in ipairs({"__StencilShadowsCleanup", "__StencilShadowEngineCleanup"}) do
-		local fn = _G[key]
-		if type(fn) == "function" then
-			pcall(fn)
-			_G[key] = nil
+	-- the older engine kept its cleanup in getgenv() when it was run from an executor
+	local envs = {_G}
+	if typeof(getgenv) == "function" then
+		local ok, env = pcall(getgenv)
+		if ok and type(env) == "table" and env ~= _G then
+			envs[2] = env
+		end
+	end
+	for _, env in ipairs(envs) do
+		for _, key in ipairs({"__StencilShadowsCleanup", "__StencilShadowEngineCleanup"}) do
+			local fn = env[key]
+			if type(fn) == "function" then
+				pcall(fn)
+				env[key] = nil
+			end
 		end
 	end
 	for _, child in ipairs(Workspace:GetChildren()) do
@@ -853,15 +864,15 @@ do
 				pts[i] = hull[i] * mul + add
 			end
 			local shape = {kind = "mesh", points = pts, shade = false, radius = (size * 0.5).Magnitude + add.Magnitude}
-			local triCount = #tris / 3
-			if triCount <= CONFIG.ExactMeshTriangles then
+			local triCount = entry.triCount
+			if verts and triCount <= CONFIG.ExactMeshTriangles then
 				local tv = tcreate(#tris)
 				for i = 1, #tris do
 					tv[i] = verts[tris[i]] * mul + add
 				end
 				shape.tris = tv
 			end
-			if triCount <= CONFIG.MeshReceiverTriangles then
+			if verts and triCount <= CONFIG.MeshReceiverTriangles then
 				local faces = {}
 				for t = 1, #tris, 3 do
 					local A = verts[tris[t]] * mul + add
@@ -986,9 +997,13 @@ do
 					task.wait()
 				end
 			end
-			entry.verts, entry.tris = verts, tris
 			entry.size, entry.center = V3(sx, sy, sz), center
 			entry.hull = supportPoints(verts, true)
+			entry.triCount = nt / 3
+			-- big meshes only ever use their outline points: don't keep all their triangles in memory
+			if entry.triCount <= max(CONFIG.ExactMeshTriangles, CONFIG.MeshReceiverTriangles) then
+				entry.verts, entry.tris = verts, tris
+			end
 		end)
 		pcall(em.Destroy, em)
 		if not ok then
@@ -2003,7 +2018,8 @@ do
 			hl.Adornee = model
 			hl.Parent = model
 		end
-		local layer = {name = name, model = model, transparency = transparency, material = material, color = color, pool = {}}
+		local layer = {name = name, model = model, transparency = transparency, material = material, color = color,
+			pool = {}, blockPool = {}}
 		Render.layers[name] = layer
 		return layer
 	end
@@ -2174,14 +2190,15 @@ do
 		end
 	end
 
-	local function acquireWedge(layer)
-		local pool = layer.pool
+	-- kind "w": a WedgePart (half of a triangle), kind "b": a thin block (a whole rectangle)
+	local function acquirePart(layer, kind)
+		local pool = kind == "b" and layer.blockPool or layer.pool
 		local w = pool[#pool]
 		if w then
 			pool[#pool] = nil
 		else
-			w = Instance.new("WedgePart")
-			w.Name = "ShadowTri"
+			w = Instance.new(kind == "b" and "Part" or "WedgePart")
+			w.Name = kind == "b" and "ShadowQuad" or "ShadowTri"
 			styleShadowPart(w, layer)
 			stats.wedges += 1
 		end
@@ -2189,8 +2206,8 @@ do
 		return w
 	end
 
-	local function releaseWedge(layer, w)
-		local pool = layer.pool
+	local function releasePart(layer, kind, w)
+		local pool = kind == "b" and layer.blockPool or layer.pool
 		if #pool < 4000 then
 			w.Parent = nil
 			pool[#pool + 1] = w
@@ -2226,69 +2243,100 @@ do
 		return true
 	end
 
-	-- tris: flat list of triangle corners; colors: one Color3 per triangle (tinted layer) or nil.
-	local function commitWedges(rec, layer, tris, colors)
+	-- A 4-point polygon that is a rectangle: its CFrame (X along the first edge, Y = normal) and size.
+	local function rectangleOf(p1, p2, p3, p4)
+		local e1, e2 = p2 - p1, p4 - p1
+		local l1, l2 = e1.Magnitude, e2.Magnitude
+		if l1 < 1e-4 or l2 < 1e-4 or abs(e1:Dot(e2)) > 1e-4 * l1 * l2 then
+			return nil
+		end
+		if (p1 + e1 + e2 - p3).Magnitude > 1e-4 * (l1 + l2) then
+			return nil
+		end
+		return CFrame.fromMatrix((p1 + p3) * 0.5, e1 / l1, e1:Cross(e2) / (l1 * l2)), l1, l2
+	end
+
+	local function partList(rec, layer, kind)
 		local parts = rec.parts
 		if not parts then
-			if not tris then
-				return
-			end
 			parts = {}
 			rec.parts = parts
 		end
-		local list = parts[layer.name]
+		local key = layer.name .. kind
+		local list = parts[key]
 		if not list then
-			if not tris then
-				return
-			end
-			list = {}
-			parts[layer.name] = list
+			list = {layer = layer, kind = kind}
+			parts[key] = list
 		end
-		local used = 0
-		if tris then
-			for t = 1, #tris - 2, 3 do
-				local w1 = list[used + 1]
-				if not w1 then
-					w1 = acquireWedge(layer)
-					list[used + 1] = w1
-				end
-				local w2 = list[used + 2]
-				if not w2 then
-					w2 = acquireWedge(layer)
-					list[used + 2] = w2
-				end
-				if placeTriangle(w1, w2, tris[t], tris[t + 1], tris[t + 2]) then
-					if colors then
-						local c = colors[(t + 2) / 3]
-						w1.Color = c
-						w2.Color = c
-					end
-					used += 2
-				end
-			end
-		end
-		for i = #list, used + 1, -1 do
-			releaseWedge(layer, list[i])
-			list[i] = nil
-		end
+		return list
 	end
 
-	local function fan(pts, s, k, tris, colors, color)
-		for j = 1, k - 2 do
-			local n = #tris
-			tris[n + 1] = pts[s]
-			tris[n + 2] = pts[s + j]
-			tris[n + 3] = pts[s + j + 1]
-			if colors then
-				colors[#colors + 1] = color
+	-- polys: {start, count, start, count, ...} into pts; colors: one Color3 per polygon or nil.
+	-- Rectangles become one thin block, everything else two wedges per triangle.
+	local function commitParts(rec, layer, pts, polys, colors)
+		if #polys == 0 and not rec.parts then
+			return
+		end
+		local wl, bl = partList(rec, layer, "w"), partList(rec, layer, "b")
+		local nw, nb = 0, 0
+		for i = 1, #polys - 1, 2 do
+			local s, k = polys[i], polys[i + 1]
+			local color = colors and colors[(i + 1) / 2]
+			local placed = false
+			if k == 4 then
+				local cf, sx, sz = rectangleOf(pts[s], pts[s + 1], pts[s + 2], pts[s + 3])
+				if cf then
+					local b = bl[nb + 1]
+					if not b then
+						b = acquirePart(layer, "b")
+						bl[nb + 1] = b
+					end
+					b.Size = V3(sx, WEDGE_THICKNESS, sz)
+					b.CFrame = cf
+					if color then
+						b.Color = color
+					end
+					nb += 1
+					placed = true
+				end
 			end
+			if not placed then
+				for j = 1, k - 2 do
+					local w1 = wl[nw + 1]
+					if not w1 then
+						w1 = acquirePart(layer, "w")
+						wl[nw + 1] = w1
+					end
+					local w2 = wl[nw + 2]
+					if not w2 then
+						w2 = acquirePart(layer, "w")
+						wl[nw + 2] = w2
+					end
+					if placeTriangle(w1, w2, pts[s], pts[s + j], pts[s + j + 1]) then
+						if color then
+							w1.Color = color
+							w2.Color = color
+						end
+						nw += 2
+					end
+				end
+			end
+		end
+		for i = #wl, nw + 1, -1 do
+			releasePart(layer, "w", wl[i])
+			wl[i] = nil
+		end
+		for i = #bl, nb + 1, -1 do
+			releasePart(layer, "b", bl[i])
+			bl[i] = nil
 		end
 	end
 
 	-- Binning: each mesh page covers one grid cell; big polygons are cut along cell borders.
 	local cellBatches = {}
 	local cellOrder = {}
-	local commitRec, commitPool, commitFallback = nil, nil, nil
+	local commitRec, commitPool = nil, nil
+	local fallbackPts, fallbackPolys = {}, {}   -- polygons that couldn't go into a mesh page
 	local CA, CB = {}, {}
 
 	local function flushBatch(batch)
@@ -2316,7 +2364,12 @@ do
 			local s = 1
 			for p = 1, batch.n do
 				local k = batch.sizes[p]
-				fan(batch.pts, s, k, commitFallback)
+				local base = #fallbackPts
+				for j = 0, k - 1 do
+					fallbackPts[base + j + 1] = batch.pts[s + j]
+				end
+				fallbackPolys[#fallbackPolys + 1] = base + 1
+				fallbackPolys[#fallbackPolys + 1] = k
 				s += k
 			end
 		end
@@ -2416,27 +2469,33 @@ do
 		end
 	end
 
+	local NO_POLYS = {}
+
 	-- Replaces everything a record drew with the polygons in `out`.
 	function Render.commit(rec, out, pool)
 		releaseMesh(rec)
 		local nPoly = out.nPoly
 		local pts, sizes, tints = out.pts, out.sizes, out.tints
-		local wedgeTris, tintTris, tintColors = nil, nil, nil
-		commitRec, commitPool, commitFallback = rec, pool, {}
+		local mainPolys, tintPolys, tintColors = {}, nil, nil
+		commitRec, commitPool = rec, pool
+		table.clear(fallbackPts)
+		table.clear(fallbackPolys)
 		local s = 1
 		local useMesh = Render.meshOk
 		for p = 1, nPoly do
 			local k = sizes[p]
 			local tint = tints[p]
 			if tint then
-				tintTris = tintTris or {}
+				tintPolys = tintPolys or {}
 				tintColors = tintColors or {}
-				fan(pts, s, k, tintTris, tintColors, tint)
+				tintPolys[#tintPolys + 1] = s
+				tintPolys[#tintPolys + 1] = k
+				tintColors[#tintColors + 1] = tint
 			elseif useMesh then
 				binPolygon(pts, s, k)
 			else
-				wedgeTris = wedgeTris or {}
-				fan(pts, s, k, wedgeTris)
+				mainPolys[#mainPolys + 1] = s
+				mainPolys[#mainPolys + 1] = k
 			end
 			s += k
 		end
@@ -2447,27 +2506,21 @@ do
 				batch.listed = false
 				cellOrder[i] = nil
 			end
-			if #commitFallback > 0 then
-				wedgeTris = commitFallback
-			end
+			commitParts(rec, Render.layers.main, fallbackPts, fallbackPolys, nil)
+		else
+			commitParts(rec, Render.layers.main, pts, mainPolys, nil)
 		end
-		commitWedges(rec, Render.layers.main, wedgeTris, nil)
-		commitWedges(rec, Render.layers.tint, tintTris, tintColors)
-		commitRec, commitFallback = nil, nil
+		commitParts(rec, Render.layers.tint, pts, tintPolys or NO_POLYS, tintColors)
+		commitRec = nil
 	end
 
 	function Render.clear(rec)
 		releaseMesh(rec)
 		local parts = rec.parts
 		if parts then
-			for name, list in pairs(parts) do
-				local layer = Render.layers[name]
+			for _, list in pairs(parts) do
 				for i = #list, 1, -1 do
-					if layer then
-						releaseWedge(layer, list[i])
-					else
-						pcall(list[i].Destroy, list[i])
-					end
+					releasePart(list.layer, list.kind, list[i])
 					list[i] = nil
 				end
 			end
@@ -2542,10 +2595,12 @@ do
 		table.clear(allPages)
 		for _, layer in pairs(Render.layers) do
 			pcall(layer.model.Destroy, layer.model)
-			for _, w in ipairs(layer.pool) do
-				pcall(w.Destroy, w)
+			for _, pool in ipairs({layer.pool, layer.blockPool}) do
+				for _, w in ipairs(pool) do
+					pcall(w.Destroy, w)
+				end
+				table.clear(pool)
 			end
-			table.clear(layer.pool)
 		end
 	end
 end
@@ -3230,11 +3285,11 @@ do
 				initialScanDone = true
 				return
 			end
-			if part.Parent ~= nil and not states[part] then
+			if not states[part] and part:IsA("BasePart") and part.Parent ~= nil then
 				register(part)
 			end
 			count += 1
-			if count % 100 == 0 and clock() > deadline then
+			if count % 200 == 0 and clock() > deadline then
 				return
 			end
 		end
@@ -3409,6 +3464,9 @@ do
 
 	local function refreshChunks(camPos)
 		local R = CONFIG.ShadowDistance
+		if not Render.meshOk then
+			R = min(R, CONFIG.PartsShadowDistance)
+		end
 		local queue = {}
 		for _, ch in pairs(chunks) do
 			local d = max(0, (ch.center - camPos).Magnitude - ch.reach)
@@ -3944,10 +4002,11 @@ if typeof(script) == "Instance" then
 	connect(script.Destroying, shutdown)
 end
 
-for _, d in ipairs(Workspace:GetDescendants()) do
-	if d:IsA("BasePart") then
-		qpush(addQ, d)
-	end
+-- Every descendant goes into the queue as-is; filtering happens in the time-budgeted loader, so
+-- starting the script on a huge map doesn't freeze the game.
+do
+	local all = Workspace:GetDescendants()
+	addQ.items, addQ.head, addQ.tail = all, 1, #all
 end
 
 if enabled then
