@@ -18,10 +18,14 @@
 	   than one shadow - which is exactly what made stencil shadows look the way they did.
 	 * If EditableMesh isn't allowed in the game, the same shadow shapes are drawn with thin wedge
 	   parts and blocks instead (same Highlight trick, same look).
-	 * Still parts are grouped into chunks around the camera and built nearest-first inside a
-	   per-frame time budget. Moving parts, vehicles and characters are rebuilt whenever they move.
-	   Shadows also land on players and loose parts, drape over terrain, and the sides of parts
-	   that face away from the light are darkened as if they were inside the old shadow volumes.
+	 * At the start the game pauses for a moment (no loading screen) while every shadow near the
+	   player is built; then they all appear at once. After that, new parts are built nearest-first
+	   inside a per-frame time budget. Moving parts, vehicles and characters are rebuilt whenever
+	   they move. Shadows also land on players and loose parts, drape over terrain, and the sides
+	   of parts that face away from the light are darkened as if they were inside the old shadow
+	   volumes (on round parts, exactly where the curve turns away).
+	 * Characters cast their real shape when it can be read; otherwise each body part becomes a
+	   rounded block of its real size. In first person your own shadows go away with your body.
 	 * Shadows follow the sun, and the moon at night.
 
 	 Other scripts can use _G.StencilShadows:  SetEnabled(bool), Toggle(), IsEnabled(),
@@ -42,6 +46,11 @@ local CONFIG = {
 	DirectTransparency = 0.62,            -- part transparency used by the "Direct" style
 	SurfaceOffset = 0.04,                 -- how far shadows float off a surface (stops z-fighting)
 	ShadeBackFaces = true,                -- sides facing away from the light are shadowed too
+	CurvedShading = "Auto",               -- dark sides of balls / cylinders follow the real curve:
+	                                      -- "Auto" = all round parts with EditableMesh, only
+	                                      -- cylinders with parts (balls cost too many parts);
+	                                      -- true = always, false = never
+	GlowingPartsStayLit = true,           -- Neon parts give off light: shadows don't darken them
 	TransparentShadows = false,           -- TRANSPARENT_SHADOWS_ENABLED: see-through parts cast
 	TransparentShadowTransparency = 0.75, -- ...lighter shadows tinted with their own color
 
@@ -97,6 +106,12 @@ local CONFIG = {
 
 	-- Roblox's own shadows ----------------------------------------------------------------------
 	DisableRobloxShadows = true,          -- Lighting.GlobalShadows is off while this is enabled
+
+	-- Start-up ----------------------------------------------------------------------------------
+	LoadPause = true,                     -- freeze the game for a moment at the start (no loading
+	                                      -- screen) so every nearby shadow appears at once
+	LoadPauseMax = 5,                     -- seconds the start-up pause may last at most
+	LoadPauseSlice = 1.2,                 -- it freezes in slices this long, with one frame between
 }
 
 ----------------------------------------------------------------------------------------------------
@@ -180,8 +195,12 @@ local savedGlobalShadows = true
 local errorCount = 0
 local rebuildRequested = false
 local refreshSoon = false      -- a new map chunk appeared: activate it next frame
+local meshMode = false         -- shadows are drawn into EditableMesh pages (not parts)
+local holdHidden = false       -- shadows stay hidden while the start-up pause builds them
+local started = false          -- the start-up pause is over
+local newCharacter = false     -- a character appeared since the last character refresh
 
-local stats = {parts = 0, records = 0, pages = 0, wedges = 0, meshLoads = 0, frameMs = 0}
+local stats = {parts = 0, records = 0, pages = 0, wedges = 0, meshLoads = 0, frameMs = 0, backend = "Parts", loadPauseMs = 0}
 
 -- Functions shared between sections. Each section below is its own do-block so the script stays
 -- far below Luau's limit of 200 locals per function.
@@ -563,11 +582,77 @@ do
 		if nLines < 3 then
 			return nil
 		end
-		return {o = o, n = n, u = u, v = v, xs = xs, ys = ys, count = count, lines = lines, nLines = nLines}
+		-- e* = the outline grown past its edges (see growFace); the same as the outline until then
+		return {o = o, n = n, u = u, v = v, xs = xs, ys = ys, count = count, lines = lines, nLines = nLines,
+			elines = lines, exs = xs, eys = ys, ecount = count}
+	end
+
+	-- Shadows float SurfaceOffset off a face. Where two faces meet at an edge, their lifted shadows
+	-- would leave a thin lit line along it, so each face's shadow area is grown past its edges until
+	-- it meets the neighbour's: by SurfaceOffset * tan(half the angle between the two faces' normals),
+	-- which is exactly SurfaceOffset at a right-angled edge. ks: that tangent per edge line (nil = 1).
+	local function growFace(face, ks)
+		local lift = CONFIG.SurfaceOffset
+		local lines, nLines = face.lines, face.nLines
+		local el = tcreate(nLines * 3)
+		for l = 0, nLines - 1 do
+			local b = l * 3
+			el[b + 1] = lines[b + 1]
+			el[b + 2] = lines[b + 2]
+			el[b + 3] = lines[b + 3] + lift * (ks and ks[l + 1] or 1)
+		end
+		-- the grown outline: where consecutive grown edge lines cross
+		local exs, eys, m = {}, {}, 0
+		for l = 0, nLines - 1 do
+			local p = ((l - 1) % nLines) * 3
+			local q = l * 3
+			local A1, B1, C1 = el[p + 1], el[p + 2], el[p + 3]
+			local A2, B2, C2 = el[q + 1], el[q + 2], el[q + 3]
+			local det = A1 * B2 - A2 * B1
+			if abs(det) > 1e-9 then
+				m += 1
+				exs[m] = (B1 * C2 - B2 * C1) / det
+				eys[m] = (A2 * C1 - A1 * C2) / det
+			end
+		end
+		if m < 3 then
+			return
+		end
+		face.elines, face.exs, face.eys, face.ecount = el, exs, eys, m
+	end
+
+	-- tan(half the angle) between each face and the face across each of its edges
+	local function growFaces(faces)
+		for fi = 1, #faces do
+			local f = faces[fi]
+			local o, u, v, n = f.o, f.u, f.v, f.n
+			local xs, ys, count = f.xs, f.ys, f.count
+			local ks = {}
+			for i = 1, count do
+				local j = i % count + 1
+				local ax, ay, bx, by = xs[i], ys[i], xs[j], ys[j]
+				local ex, ey = bx - ax, by - ay
+				if sqrt(ex * ex + ey * ey) > 1e-7 then -- the same edges edgeLines keeps
+					local pa, pb = o + u * ax + v * ay, o + u * bx + v * by
+					local tol = 1e-4 * (1 + pa.Magnitude + pb.Magnitude)
+					local k = 1
+					for gi = 1, #faces do
+						local g = faces[gi]
+						if gi ~= fi and abs((pa - g.o):Dot(g.n)) < tol and abs((pb - g.o):Dot(g.n)) < tol then
+							local c = n:Dot(g.n)
+							k = min(4, n:Cross(g.n).Magnitude / max(1 + c, 1e-3))
+							break
+						end
+					end
+					ks[#ks + 1] = k
+				end
+			end
+			growFace(f, ks)
+		end
 	end
 
 	-- Convex polyhedron from vertices and face index loops (outward normals worked out here).
-	local function makePolyhedron(verts, faceLists)
+	local function makePolyhedron(verts, faceLists, skipGrowth)
 		local centroid = averageOf(verts)
 		local edges, seen, faces = {}, {}, {}
 		local radius = 0
@@ -602,6 +687,9 @@ do
 					edges[#edges + 1] = j
 				end
 			end
+		end
+		if not skipGrowth then
+			growFaces(faces)
 		end
 		return {kind = "poly", verts = verts, edges = edges, faces = faces, radius = radius, shade = true}
 	end
@@ -645,6 +733,13 @@ do
 				fs[i] = nf
 			end
 			copy.faces = fs
+		end
+		if shape.terms then
+			local ts = {}
+			for i, t in ipairs(shape.terms) do
+				ts[i] = {c = t.c + offset, axis = t.axis, rinv2 = t.rinv2}
+			end
+			copy.terms = ts
 		end
 		copy.radius = shape.radius + offset.Magnitude
 		return copy
@@ -705,8 +800,7 @@ do
 		end)
 	end
 
-	-- Cylinder approximated by a prism whose flat sides touch the real curve (so shadows drawn on
-	-- the sides never sink into the round surface).
+	-- Cylinder outline: a prism whose flat sides touch the real curve.
 	local function prism(len, r, segs, axis)
 		local rc = r / cos(pi / segs)
 		local h = len / 2
@@ -731,102 +825,357 @@ do
 		end
 		faces[#faces + 1] = capA
 		faces[#faces + 1] = capB
-		return makePolyhedron(verts, faces)
+		return makePolyhedron(verts, faces, true)
 	end
 
-	function Shapes.cylinderX(size, segs, offset)
-		return cached("X" .. vkey(size) .. "/" .. segs, offset, function()
-			return prism(size.X, min(size.Y, size.Z) / 2, segs, "X")
-		end)
+	-- Round surfaces get their own facets that wrap the real curve from just outside it. The
+	-- corners sit only as far out as needed for every facet to clear the curve, neighbouring
+	-- facets share their corners (so there are no cracks), and every facet knows the true surface
+	-- normal there ("term"), so a dark side is cut exactly where the real surface turns away from
+	-- the light instead of following the facets.
+	local SURFACE_FLOAT = {0.07, 0.15, 0.35} -- studs a facet corner may float off the curve: near / mid / far
+
+	local function outlineSegments(lod)
+		local list = CONFIG.CurveSegments
+		return list[lod] or list[#list] or 12
 	end
 
-	function Shapes.cylinderY(height, diameter, segs, offset)
-		return cached(string.format("Y%.3f,%.3f/%d", height, diameter, segs), offset, function()
-			return prism(height, diameter / 2, segs, "Y")
-		end)
-	end
-
-	-- Receiving faces of an ellipsoid: a UV sphere pushed out so its flat faces sit on the surface.
-	local function ellipsoidFaces(rx, ry, rz, segs)
-		local m = max(8, segs)
-		local k = max(4, floor(m / 2))
-		local push = 1 / cos(pi * 1.4143 / m)
-		local rings = {}
-		for i = 0, k do
-			local theta = pi * i / k
-			local st, ct = sin(theta), cos(theta)
-			local ring = {}
-			for j = 0, m - 1 do
-				local phi = 2 * pi * j / m
-				ring[j] = V3(st * cos(phi) * rx * push, ct * ry * push, st * sin(phi) * rz * push)
-			end
-			rings[i] = ring
+	-- How many facets go around a curve (largest radius R, smallest r), and the clearance they
+	-- keep from it as a fraction of r.
+	local function surfaceSegments(R, r, lod, sphere)
+		local mrel = max(0.004, 0.012 / max(r, 1e-3))
+		local slack = (SURFACE_FLOAT[lod] or 0.3) / max(R, 1e-3) - mrel
+		-- with parts every facet costs parts of its own, so fewer of them
+		local most = sphere and (meshMode and 36 or 20) or (meshMode and 64 or 24)
+		local m = most
+		if slack > 1e-4 then
+			-- a facet's corners are about this angle away from its middle
+			local delta = sqrt(2 * slack)
+			m = ceil(2 * pi / (delta * (sphere and 1.4142 or 2)))
 		end
-		local faces = {}
+		return max(sphere and 16 or 12, min(most, m)), mrel
+	end
+
+	-- Smallest distance from the centre to the plane of any facet of a unit lat-long sphere
+	-- (m facets around, k rows from pole to pole).
+	local function sphereClearance(m, k)
+		local dmin = 1
+		local c, s = cos(2 * pi / m), sin(2 * pi / m)
 		for i = 0, k - 1 do
-			for j = 0, m - 1 do
-				local j2 = (j + 1) % m
-				local fv
-				if i == 0 then
-					fv = {rings[0][0], rings[1][j2], rings[1][j]}
-				elseif i == k - 1 then
-					fv = {rings[i][j], rings[i][j2], rings[k][0]}
-				else
-					fv = {rings[i][j], rings[i][j2], rings[i + 1][j2], rings[i + 1][j]}
+			local t1, t2 = pi * i / k, pi * (i + 1) / k
+			local p1 = V3(sin(t1), cos(t1), 0)
+			local p2 = V3(sin(t1) * c, cos(t1), sin(t1) * s)
+			local p3 = V3(sin(t2) * c, cos(t2), sin(t2) * s)
+			local p4 = V3(sin(t2), cos(t2), 0)
+			local loop
+			if i == 0 then
+				loop = {p1, p3, p4}
+			elseif i == k - 1 then
+				loop = {p1, p2, p3}
+			else
+				loop = {p1, p2, p3, p4}
+			end
+			local nrm = newellNormal(loop)
+			if nrm.Magnitude > 1e-12 then
+				local d = abs(nrm.Unit:Dot(p1))
+				if d < dmin then
+					dmin = d
 				end
-				local nrm = newellNormal(fv)
-				if nrm.Magnitude > 1e-12 then
-					nrm = nrm.Unit
-					if nrm:Dot(averageOf(fv)) < 0 then
-						nrm = -nrm
+			end
+		end
+		return dmin
+	end
+
+	-- A facet whose corners are already in order around it (either way round). `inside` is any
+	-- point inside the (convex) shape.
+	local function quickFace(verts, inside, term)
+		local count = #verts
+		local o = averageOf(verts)
+		local nrm = newellNormal(verts)
+		local mag = nrm.Magnitude
+		if mag < 1e-12 then
+			return nil
+		end
+		nrm /= mag
+		if nrm:Dot(o - inside) < 0 then
+			nrm = -nrm
+			local flipped = tcreate(count)
+			for i = 1, count do
+				flipped[i] = verts[count + 1 - i]
+			end
+			verts = flipped
+		end
+		local u = verts[2] - verts[1]
+		u -= nrm * u:Dot(nrm)
+		local um = u.Magnitude
+		if um < 1e-9 then
+			return nil
+		end
+		u /= um
+		local v = nrm:Cross(u)
+		local xs, ys = tcreate(count), tcreate(count)
+		for i = 1, count do
+			local d = verts[i] - o
+			xs[i], ys[i] = d:Dot(u), d:Dot(v)
+		end
+		if polyArea(xs, ys, count) < 1e-9 then
+			return nil
+		end
+		local lines, nLines = edgeLines(xs, ys, count)
+		if nLines < 3 then
+			return nil
+		end
+		-- lift 0: the facets already float just off the curve
+		return {o = o, n = nrm, u = u, v = v, xs = xs, ys = ys, count = count, lines = lines, nLines = nLines,
+			elines = lines, exs = xs, eys = ys, ecount = count, lift = 0, term = term}
+	end
+
+	-- Facets of a surface of revolution around `axis` (e1, e2 complete the frame). rings:
+	-- {t, rho, term} from one end to the other, t = position along the axis, rho = radius
+	-- (0 = a pole); `term` belongs to the facets between that ring and the next. An end ring with
+	-- rho > 0 gets a flat cap with no term. `scale` (optional) stretches everything (ellipsoids).
+	local function latheShell(axis, e1, e2, rings, m, scale, faces)
+		local verts = {}
+		local nr = #rings
+		for i = 1, nr do
+			local t, rho = rings[i][1], rings[i][2]
+			local list = {}
+			if rho <= 0 then
+				list[0] = axis * t
+			else
+				for j = 0, m - 1 do
+					local phi = 2 * pi * j / m
+					list[j] = axis * t + (e1 * cos(phi) + e2 * sin(phi)) * rho
+				end
+			end
+			if scale then
+				for j, p in pairs(list) do
+					list[j] = p * scale
+				end
+			end
+			verts[i] = list
+		end
+		for i = 1, nr - 1 do
+			local A, B = verts[i], verts[i + 1]
+			local aPole, bPole = rings[i][2] <= 0, rings[i + 1][2] <= 0
+			local term = rings[i][3]
+			if not (aPole and bPole) then
+				for j = 0, m - 1 do
+					local j2 = (j + 1) % m
+					local loop
+					if aPole then
+						loop = {A[0], B[j], B[j2]}
+					elseif bPole then
+						loop = {A[j], A[j2], B[0]}
+					else
+						loop = {A[j], A[j2], B[j2], B[j]}
 					end
-					local face = makeFace(nrm, fv)
-					if face then
-						faces[#faces + 1] = face
+					local f = quickFace(loop, ZERO, term)
+					if f then
+						faces[#faces + 1] = f
 					end
 				end
 			end
 		end
-		return faces
+		for _, i in ipairs({1, nr}) do
+			if rings[i][2] > 0 then
+				local cap = tcreate(m)
+				for j = 0, m - 1 do
+					cap[j + 1] = verts[i][j]
+				end
+				local f = quickFace(cap, ZERO, nil)
+				if f then
+					faces[#faces + 1] = f
+				end
+			end
+		end
+	end
+
+	local function cylinderShape(len, r, axisName, lod, offset)
+		r = max(r, 1e-3)
+		local segs = outlineSegments(lod)
+		local m, mrel = surfaceSegments(r, r, lod, false)
+		local key = string.format("%s%.3f,%.3f/%d/%d", axisName, len, r, segs, m)
+		return cached(key, offset, function()
+			local shape = prism(len, r, segs, axisName)
+			local axis, e1, e2 = YAXIS, ZAXIS, XAXIS
+			if axisName == "X" then
+				axis, e1, e2 = XAXIS, YAXIS, ZAXIS
+			end
+			-- the round side floats just off the curve; the flat ends float SurfaceOffset like
+			-- any flat face, and the side reaches out to meet them
+			local rv = r * (1 + mrel) / cos(pi / m)
+			local h = len / 2 + CONFIG.SurfaceOffset
+			local faces = {}
+			latheShell(axis, e1, e2, {{-h, rv, 1}, {h, rv, 1}}, m, nil, faces)
+			shape.faces = faces
+			shape.terms = {{c = ZERO, axis = axis}}
+			return shape
+		end)
+	end
+
+	function Shapes.cylinderX(size, lod, offset)
+		return cylinderShape(size.X, min(size.Y, size.Z) / 2, "X", lod, offset)
+	end
+
+	function Shapes.cylinderY(height, diameter, lod, offset)
+		return cylinderShape(height, diameter / 2, "Y", lod, offset)
 	end
 
 	local function sphereAt(c, r)
 		return {c = c, e1 = V3(r, 0, 0), e2 = V3(0, r, 0), e3 = V3(0, 0, r)}
 	end
 
-	function Shapes.ellipsoid(radii, segs, offset)
-		return cached("E" .. vkey(radii) .. "/" .. segs, offset, function()
+	local function ellipsoidAt(c, radii)
+		return {c = c, e1 = V3(radii.X, 0, 0), e2 = V3(0, radii.Y, 0), e3 = V3(0, 0, radii.Z)}
+	end
+
+	local MIN_RADII = V3(1e-3, 1e-3, 1e-3)
+
+	function Shapes.ellipsoid(radii, lod, offset)
+		radii = radii:Max(MIN_RADII)
+		local R = max(radii.X, radii.Y, radii.Z)
+		local m, mrel = surfaceSegments(R, min(radii.X, radii.Y, radii.Z), lod, true)
+		local segs = outlineSegments(lod)
+		return cached("E" .. vkey(radii) .. "/" .. segs .. "/" .. m, offset, function()
+			local k = max(2, ceil(m / 2))
+			local push = (1 + mrel) / sphereClearance(m, k)
+			local rings = {}
+			for i = 0, k do -- unit sphere, +Y pole to -Y pole
+				local th = pi * i / k
+				rings[i + 1] = {cos(th) * push, (i == 0 or i == k) and 0 or sin(th) * push, 1}
+			end
+			local faces = {}
+			latheShell(YAXIS, XAXIS, ZAXIS, rings, m, radii, faces)
 			return {
 				kind = "round",
 				segs = segs,
 				shade = true,
-				ellipsoids = {{c = ZERO, e1 = V3(radii.X, 0, 0), e2 = V3(0, radii.Y, 0), e3 = V3(0, 0, radii.Z)}},
-				faces = ellipsoidFaces(radii.X, radii.Y, radii.Z, segs),
-				radius = max(radii.X, radii.Y, radii.Z),
+				ellipsoids = {ellipsoidAt(ZERO, radii)},
+				faces = faces,
+				terms = {{c = ZERO, rinv2 = V3(1 / (radii.X * radii.X), 1 / (radii.Y * radii.Y), 1 / (radii.Z * radii.Z))}},
+				radius = R * push,
 			}
 		end)
 	end
 
-	function Shapes.ball(size, segs)
+	function Shapes.ball(size, lod)
 		local r = min(size.X, size.Y, size.Z) / 2
-		return Shapes.ellipsoid(V3(r, r, r), segs)
+		return Shapes.ellipsoid(V3(r, r, r), lod)
 	end
 
-	function Shapes.capsule(size, segs)
+	-- Facets around a cylinder between two half-ellipsoid ends, along the X or Y axis: a capsule
+	-- (round ends) or the classic head (flatter ends). half: half the straight middle, r: radius,
+	-- depth: how far each end sticks out past the middle.
+	local function cappedShell(axisName, half, r, depth, m, mrel)
+		local kh = max(1, ceil(m / 4))
+		local p = (1 + mrel) / sphereClearance(m, kh * 2)
+		local rings = {}
+		for i = 0, kh do -- the negative end, from its pole to its rim
+			local th = (pi / 2) * i / kh
+			rings[#rings + 1] = {-half - cos(th) * depth * p, i == 0 and 0 or sin(th) * r * p, 2}
+		end
+		rings[#rings][3] = 3 -- the straight middle
+		for i = kh, 0, -1 do -- the positive end, from its rim to its pole
+			local th = (pi / 2) * i / kh
+			rings[#rings + 1] = {half + cos(th) * depth * p, i == 0 and 0 or sin(th) * r * p, 1}
+		end
+		local axis, e1, e2 = YAXIS, ZAXIS, XAXIS
+		local endInv = V3(1 / (r * r), 1 / (depth * depth), 1 / (r * r))
+		if axisName == "X" then
+			axis, e1, e2 = XAXIS, YAXIS, ZAXIS
+			endInv = V3(1 / (depth * depth), 1 / (r * r), 1 / (r * r))
+		end
+		local faces = {}
+		latheShell(axis, e1, e2, rings, m, nil, faces)
+		local terms = {
+			{c = axis * half, rinv2 = endInv},
+			{c = axis * -half, rinv2 = endInv},
+			{c = ZERO, axis = axis},
+		}
+		return faces, terms, p
+	end
+
+	function Shapes.capsule(size, lod)
 		local r = min(size.Y, size.Z) / 2
 		local half = size.X / 2 - r
 		if half < 0.01 then
-			return Shapes.ball(size, segs)
+			return Shapes.ball(size, lod)
 		end
-		return cached("K" .. vkey(size) .. "/" .. segs, nil, function()
+		local segs = outlineSegments(lod)
+		local m, mrel = surfaceSegments(r, r, lod, true)
+		return cached("K" .. vkey(size) .. "/" .. segs .. "/" .. m, nil, function()
+			local faces, terms, p = cappedShell("X", half, r, r, m, mrel)
 			return {
 				kind = "round",
 				segs = segs,
 				shade = true,
 				ellipsoids = {sphereAt(V3(-half, 0, 0), r), sphereAt(V3(half, 0, 0), r)},
-				faces = prism(size.X, r, segs, "X").faces,
-				radius = size.X / 2,
+				faces = faces,
+				terms = terms,
+				radius = half + r * p,
 			}
+		end)
+	end
+
+	-- Outline-only shapes (no facets, so no dark sides and nothing drawn on them) for parts whose
+	-- exact look isn't known, like avatar parts and hats when their meshes can't be read.
+	function Shapes.solidEllipsoid(radii, lod, offset)
+		radii = radii:Max(MIN_RADII)
+		local segs = outlineSegments(lod)
+		return cached("S" .. vkey(radii) .. "/" .. segs, offset, function()
+			return {kind = "round", segs = segs, shade = false, ellipsoids = {ellipsoidAt(ZERO, radii)},
+				radius = max(radii.X, radii.Y, radii.Z)}
+		end)
+	end
+
+	-- The classic head: a cylinder with rounded top and bottom. Its real mesh isn't exactly this,
+	-- so it gets no dark side of its own, but it does take shadows (a roof's, a hat's) on facets
+	-- that fit it closely.
+	function Shapes.classicHead(height, diameter, lod, offset)
+		local segs = outlineSegments(lod)
+		local r, depth = max(diameter * 0.49, 1e-3), max(height * 0.3, 1e-3)
+		local half = max(height * 0.5 - depth, 0)
+		local m, mrel = surfaceSegments(max(r, depth), min(r, depth), lod, true)
+		return cached(string.format("H%.3f,%.3f/%d/%d", height, diameter, segs, m), offset, function()
+			local faces, terms = cappedShell("Y", half, r, depth, m, mrel)
+			return {
+				kind = "round",
+				segs = segs,
+				shade = false,
+				ellipsoids = {ellipsoidAt(V3(0, half, 0), V3(r, depth, r)), ellipsoidAt(V3(0, -half, 0), V3(r, depth, r))},
+				faces = faces,
+				terms = terms,
+				radius = max(r, height * 0.5) * 1.42,
+			}
+		end)
+	end
+
+	-- A block with rounded edges that fills `size`: k sets the rounding (as a fraction of the
+	-- smallest side). Used for avatar parts whose mesh can't be read: it keeps each part's real
+	-- size and bulk, so the shadow still has the avatar's build.
+	local OCTANT = {
+		V3(1, 0, 0), V3(0, 1, 0), V3(0, 0, 1),
+		V3(0.7071, 0.7071, 0), V3(0.7071, 0, 0.7071), V3(0, 0.7071, 0.7071),
+		V3(0.5774, 0.5774, 0.5774),
+	}
+
+	function Shapes.roundedBlock(size, k)
+		return cached(string.format("R%s/%.2f", vkey(size), k), nil, function()
+			local hx, hy, hz = size.X / 2, size.Y / 2, size.Z / 2
+			local rho = min(k * min(size.X, size.Y, size.Z), hx, hy, hz)
+			local pts = {}
+			for sx = -1, 1, 2 do
+				for sy = -1, 1, 2 do
+					for sz = -1, 1, 2 do
+						local c = V3(sx * (hx - rho), sy * (hy - rho), sz * (hz - rho))
+						for _, d in ipairs(OCTANT) do
+							pts[#pts + 1] = c + V3(sx * d.X, sy * d.Y, sz * d.Z) * rho
+						end
+					end
+				end
+			end
+			return {kind = "mesh", points = pts, shade = false, radius = (size * 0.5).Magnitude}
 		end)
 	end
 
@@ -882,6 +1231,7 @@ do
 					if nrm.Magnitude > 1e-9 then
 						local f = makeFace(nrm.Unit, {A, B, C})
 						if f then
+							growFace(f, nil)
 							faces[#faces + 1] = f
 						end
 					end
@@ -891,6 +1241,18 @@ do
 				shape.faces = Shapes.box(size, add).faces
 			end
 			return shape
+		end)
+	end
+
+	-- Only the outline of real mesh data (avatar parts: cheap to redo every frame, no dark sides).
+	function Shapes.fromMeshHull(entry, mul, add)
+		return cached("O" .. entry.id .. "|" .. vkey(mul) .. "|" .. vkey(add), nil, function()
+			local hull = entry.hull
+			local pts = tcreate(#hull)
+			for i = 1, #hull do
+				pts[i] = hull[i] * mul + add
+			end
+			return {kind = "mesh", points = pts, shade = false, radius = (mul:Abs() * 0.5).Magnitude + add.Magnitude}
 		end)
 	end
 end
@@ -1123,7 +1485,25 @@ do
 		if #pts < 4 then
 			return nil
 		end
-		return supportPoints(pts, false)
+		-- Hits that all land on the faces of one box mean the part only has box collisions (the
+		-- usual avatar setting), which says nothing about how the mesh really looks.
+		local lo, hi = pts[1], pts[1]
+		for i = 2, #pts do
+			lo = lo:Min(pts[i])
+			hi = hi:Max(pts[i])
+		end
+		local tol = (hi - lo) * 0.02
+		local onBox = 0
+		for i = 1, #pts do
+			local p = pts[i]
+			if p.X - lo.X <= tol.X or hi.X - p.X <= tol.X or p.Y - lo.Y <= tol.Y or hi.Y - p.Y <= tol.Y
+				or p.Z - lo.Z <= tol.Z or hi.Z - p.Z <= tol.Z then
+				onBox += 1
+			end
+		end
+		local out = supportPoints(pts, false)
+		out.boxy = onBox >= #pts * 0.95
+		return out
 	end
 
 	-- Normalized outline points, or nil. The second result is true when it should be asked again.
@@ -1156,17 +1536,35 @@ do
 		PART_CAPSULE = Enum.PartType.Capsule
 	end)
 
-	local function segmentsFor(lod)
-		local list = CONFIG.CurveSegments
-		return list[lod] or list[#list] or 12
-	end
+	-- Avatar parts whose mesh can't be read become blocks with rounded edges that fill the part
+	-- (so the shadow keeps the avatar's real build). How round, as a fraction of the smallest side:
+	-- limbs are nearly round across, torsos are boxier.
+	local BODY_ROUNDING = {
+		Head = 0.42, UpperTorso = 0.24, LowerTorso = 0.24, Torso = 0.2,
+		LeftUpperArm = 0.42, RightUpperArm = 0.42, LeftLowerArm = 0.44, RightLowerArm = 0.44,
+		LeftHand = 0.45, RightHand = 0.45,
+		LeftUpperLeg = 0.4, RightUpperLeg = 0.4, LeftLowerLeg = 0.42, RightLowerLeg = 0.42,
+		LeftFoot = 0.4, RightFoot = 0.4,
+		["Left Arm"] = 0.4, ["Right Arm"] = 0.4, ["Left Leg"] = 0.38, ["Right Leg"] = 0.38,
+	}
+	-- R15 body part -> the HumanoidDescription field that says which body is worn there
+	local DESC_FIELD = {
+		UpperTorso = "Torso", LowerTorso = "Torso",
+		LeftUpperArm = "LeftArm", LeftLowerArm = "LeftArm", LeftHand = "LeftArm",
+		RightUpperArm = "RightArm", RightLowerArm = "RightArm", RightHand = "RightArm",
+		LeftUpperLeg = "LeftLeg", LeftLowerLeg = "LeftLeg", LeftFoot = "LeftLeg",
+		RightUpperLeg = "RightLeg", RightLowerLeg = "RightLeg", RightFoot = "RightLeg",
+	}
+	-- R6 body part -> the CharacterMesh body part that swaps its block for a package mesh
+	local R6_MESH = {
+		Torso = "Torso", ["Left Arm"] = "LeftArm", ["Right Arm"] = "RightArm",
+		["Left Leg"] = "LeftLeg", ["Right Leg"] = "RightLeg",
+	}
 
-	local function fallbackMeshShape(state, size, offset)
+	local function fallbackMeshShape(state, size, offset, lod)
 		if state.character then
-			if state.accessory then
-				return Shapes.ellipsoid(size * 0.45, 12, offset)
-			end
-			return Shapes.box(size * 0.9, offset)
+			-- a hat, hair or tool mesh that can't be read: a smooth blob filling most of it
+			return Shapes.solidEllipsoid(size * 0.47, lod, offset)
 		end
 		if CONFIG.MissingMeshFallback == "Box" then
 			return Shapes.box(size, offset)
@@ -1174,10 +1572,71 @@ do
 		return nil
 	end
 
-	local function meshPartShape(state, part, size)
+	local function rayKey(part, content)
+		local uri = content and content.Uri
+		return (uri and uri ~= "") and (uri .. "|" .. tostring(part.CollisionFidelity)) or nil
+	end
+
+	-- A MeshPart of a character: body part, hat, hair or tool. Only outlines are used (no dark
+	-- sides drawn on the avatar), so nothing ever sticks out of it.
+	local function avatarMeshShape(state, part, size, lod)
+		local name = part.Name
+		local info = state.charInfo
+		local field = DESC_FIELD[name]
+		if field and info and info.blocky and info.blocky[field] then
+			return Shapes.box(size) -- the default blocky body: these parts really are boxes
+		end
 		local content = part.MeshContent
-		-- avatar meshes almost never allow reading, so characters go straight to ray sampling
-		local entry = not state.character and MeshData.get(content) or nil
+		-- 1. the real mesh, when the game lets meshes be read
+		local entry = MeshData.allowed and MeshData.get(content) or nil
+		if entry then
+			if entry.status == "ready" then
+				return Shapes.fromMeshHull(entry, size, ZERO)
+			end
+			waitForMesh(entry, state) -- redrawn when it arrives, with a stand-in until then
+		end
+		-- 2. the real collision shape, unless that's just a box (avatars usually only have boxes)
+		if CONFIG.RaySampleMeshes then
+			local key = rayKey(part, content)
+			local pts, busy = RaySample.get(part, key)
+			if pts and not pts.boxy then
+				return Shapes.fromPoints(key or ("i" .. state.id), pts, size, ZERO, false)
+			elseif busy then
+				return nil, true
+			end
+		end
+		-- 3. a stand-in with the part's real size
+		if state.accessory then
+			return Shapes.solidEllipsoid(size * 0.47, lod)
+		end
+		return Shapes.roundedBlock(size, BODY_ROUNDING[name] or 0.3)
+	end
+
+	-- Character Parts that aren't the plain blocks they look like: the classic head, and R6 limbs
+	-- covered by a package (CharacterMesh). nil = use the normal (exact) rules.
+	local function avatarPartShape(state, part, size, lod)
+		local name = part.Name
+		if name == "Head" then
+			local mesh = part:FindFirstChildWhichIsA("DataModelMesh")
+			if mesh and mesh:IsA("SpecialMesh") and mesh.MeshType == Enum.MeshType.Head then
+				local scale = mesh.Scale
+				return Shapes.classicHead(size.Y * scale.Y, min(size.X, size.Y, size.Z) * scale.X, lod, mesh.Offset)
+			end
+		end
+		local info = state.charInfo
+		local bodyPart = R6_MESH[name]
+		if bodyPart and info and info.charMeshes and info.charMeshes[bodyPart] then
+			return Shapes.roundedBlock(size, BODY_ROUNDING[name] or 0.35)
+		end
+		return nil
+	end
+
+	local function meshPartShape(state, part, size, lod)
+		if state.character then
+			return avatarMeshShape(state, part, size, lod)
+		end
+		local content = part.MeshContent
+		local entry = MeshData.get(content)
 		if entry then
 			if entry.status == "ready" then
 				return Shapes.fromMesh(entry, size, ZERO)
@@ -1186,8 +1645,7 @@ do
 			end
 		end
 		if CONFIG.RaySampleMeshes then
-			local uri = content and content.Uri
-			local key = (uri and uri ~= "") and (uri .. "|" .. tostring(part.CollisionFidelity)) or nil
+			local key = rayKey(part, content)
 			local pts, busy = RaySample.get(part, key)
 			if pts then
 				return Shapes.fromPoints(key or ("i" .. state.id), pts, size, ZERO, true)
@@ -1195,7 +1653,7 @@ do
 				return nil, true
 			end
 		end
-		return fallbackMeshShape(state, size, nil)
+		return fallbackMeshShape(state, size, nil, lod)
 	end
 
 	local function unionShape(state, part, size)
@@ -1213,26 +1671,31 @@ do
 		return Shapes.box(size)
 	end
 
-	local function specialMeshShape(state, mesh, size, segs)
+	local function specialMeshShape(state, mesh, size, lod)
 		local scale, offset = mesh.Scale, mesh.Offset
 		if mesh:IsA("SpecialMesh") then
 			local meshType = mesh.MeshType
 			if meshType == Enum.MeshType.FileMesh then
-				local entry = not state.character and MeshData.get(mesh.MeshContent) or nil
+				local character = state.character
+				local entry = (not character or MeshData.allowed) and MeshData.get(mesh.MeshContent) or nil
 				if entry then
 					if entry.status == "ready" then
-						return Shapes.fromMesh(entry, entry.size * scale, entry.center * scale + offset)
-					elseif waitForMesh(entry, state) then
+						local mul, add = entry.size * scale, entry.center * scale + offset
+						if character then
+							return Shapes.fromMeshHull(entry, mul, add)
+						end
+						return Shapes.fromMesh(entry, mul, add)
+					elseif waitForMesh(entry, state) and not character then
 						return nil, true
 					end
 				end
-				return fallbackMeshShape(state, size * scale, offset)
+				return fallbackMeshShape(state, size * scale, offset, lod)
 			elseif meshType == Enum.MeshType.Sphere then
-				return Shapes.ellipsoid(size * scale * 0.5, segs, offset)
+				return Shapes.ellipsoid(size * scale * 0.5, lod, offset)
 			elseif meshType == Enum.MeshType.Cylinder then
-				return Shapes.cylinderY(size.Y * scale.Y, min(size.X * scale.X, size.Z * scale.Z), segs, offset)
+				return Shapes.cylinderY(size.Y * scale.Y, min(size.X * scale.X, size.Z * scale.Z), lod, offset)
 			elseif meshType == Enum.MeshType.Head then
-				return Shapes.cylinderY(size.Y * scale.Y, min(size.X, size.Y, size.Z) * scale.X, segs, offset)
+				return Shapes.cylinderY(size.Y * scale.Y, min(size.X, size.Y, size.Z) * scale.X, lod, offset)
 			elseif meshType == Enum.MeshType.Wedge then
 				return Shapes.wedge(size * scale, offset)
 			elseif meshType == Enum.MeshType.CornerWedge then
@@ -1240,7 +1703,7 @@ do
 			end
 			return Shapes.box(size * scale, offset)
 		elseif mesh:IsA("CylinderMesh") then
-			return Shapes.cylinderY(size.Y * scale.Y, min(size.X * scale.X, size.Z * scale.Z), segs, offset)
+			return Shapes.cylinderY(size.Y * scale.Y, min(size.X * scale.X, size.Z * scale.Z), lod, offset)
 		end
 		return Shapes.box(size * scale, offset)
 	end
@@ -1249,7 +1712,7 @@ do
 		local part = state.part
 		local size = part.Size
 		if part:IsA("MeshPart") then
-			return meshPartShape(state, part, size)
+			return meshPartShape(state, part, size, lod)
 		elseif part:IsA("PartOperation") then
 			return unionShape(state, part, size)
 		end
@@ -1259,22 +1722,27 @@ do
 		elseif className == "CornerWedgePart" then
 			return Shapes.cornerWedge(size)
 		elseif part:IsA("Part") then
-			local segs = segmentsFor(lod)
+			if state.character then
+				local s = avatarPartShape(state, part, size, lod)
+				if s then
+					return s
+				end
+			end
 			local mesh = part:FindFirstChildWhichIsA("DataModelMesh")
 			if mesh then
-				return specialMeshShape(state, mesh, size, segs)
+				return specialMeshShape(state, mesh, size, lod)
 			end
 			local shape = part.Shape
 			if shape == Enum.PartType.Ball then
-				return Shapes.ball(size, segs)
+				return Shapes.ball(size, lod)
 			elseif shape == Enum.PartType.Cylinder then
-				return Shapes.cylinderX(size, segs)
+				return Shapes.cylinderX(size, lod)
 			elseif shape == Enum.PartType.Wedge then
 				return Shapes.wedge(size)
 			elseif shape == Enum.PartType.CornerWedge then
 				return Shapes.cornerWedge(size)
 			elseif PART_CAPSULE and shape == PART_CAPSULE then
-				return Shapes.capsule(size, segs)
+				return Shapes.capsule(size, lod)
 			end
 		end
 		return Shapes.box(size)
@@ -1477,9 +1945,9 @@ do
 		local oa, ob, oz = o:Dot(a), o:Dot(b), o:Dot(L)
 		wf.zo = oz
 		local ua, ub, va, vb = u:Dot(a), u:Dot(b), v:Dot(a), v:Dot(b)
-		local xs, ys = lf.xs, lf.ys
+		local xs, ys = lf.exs, lf.eys
 		local minX, maxX, minY, maxY, minZ, maxZ = huge, -huge, huge, -huge, huge, -huge
-		for i = 1, lf.count do
+		for i = 1, lf.ecount do
 			local x, y = xs[i], ys[i]
 			local px = oa + ua * x + va * y
 			local py = ob + ub * x + vb * y
@@ -1508,8 +1976,15 @@ do
 	end
 
 	function getWorldFaces(state, shape)
-		if state.wfFrame == frameId and state.wfShape == shape and state.wfLight == Light.version then
-			return state.wf
+		if state.wfShape == shape and state.wfLight == Light.version then
+			-- moving parts: once per frame; still parts: until they move (round parts have many faces)
+			if state.dynamic then
+				if state.wfFrame == frameId then
+					return state.wf
+				end
+			elseif state.wfCf == state.cfVersion then
+				return state.wf
+			end
 		end
 		local list = state.wf or {}
 		local faces = shape.faces
@@ -1520,7 +1995,7 @@ do
 		for i = #list, #faces + 1, -1 do
 			list[i] = nil
 		end
-		state.wf, state.wfFrame, state.wfShape, state.wfLight = list, frameId, shape, Light.version
+		state.wf, state.wfFrame, state.wfShape, state.wfLight, state.wfCf = list, frameId, shape, Light.version, state.cfVersion
 		return list
 	end
 end
@@ -1536,9 +2011,10 @@ do
 		Out.nPoly = 0
 	end
 
-	-- A polygon in a face's 2D coordinates, lifted slightly off the face.
+	-- A polygon in a face's 2D coordinates, lifted slightly off the face (facets of round parts
+	-- already float off the curve: lift 0).
 	function emitFace(wf, xs, ys, n, tint)
-		local o = wf.o + wf.n * CONFIG.SurfaceOffset
+		local o = wf.o + wf.n * (wf.lf.lift or CONFIG.SurfaceOffset)
 		local u, v = wf.u, wf.v
 		local pts = Out.pts
 		local np = Out.np
@@ -1597,7 +2073,8 @@ do
 
 	local function finishPolygon(count, wf, g, tint)
 		local lf = wf.lf
-		local n, xs, ys = clipByLines(PX, PY, count, lf.lines, lf.nLines)
+		-- cut to the face, grown past its edges so shadows on neighbouring faces meet
+		local n, xs, ys = clipByLines(PX, PY, count, lf.elines, lf.nLines)
 		if n < 3 then
 			return
 		end
@@ -2356,6 +2833,8 @@ do
 				-- something is badly wrong with EditableMesh here: switch to parts for good
 				warnOnce("pageAdd", "EditableMesh write failed (" .. tostring(fids) .. "), switching to parts.")
 				Render.meshOk = false
+				meshMode = false
+				stats.backend = "Parts"
 				destroyPage(pg)
 				rebuildRequested = true
 			end
@@ -2546,6 +3025,7 @@ do
 	end
 
 	function Render.setVisible(on)
+		on = on and not holdHidden
 		for _, layer in pairs(Render.layers) do
 			local target = on and Workspace or nil
 			if layer.model.Parent ~= target then
@@ -2580,6 +3060,8 @@ do
 			end)
 			if okPart and part then
 				Render.meshOk = true
+				meshMode = true
+				stats.backend = "EditableMesh"
 				part:Destroy()
 			else
 				warnOnce("meshpart", "Couldn't create EditableMesh parts (" .. tostring(part) .. "), using parts.")
@@ -2649,13 +3131,65 @@ do
 		return Workspace:GetPartBoundsInBox(CFrame.fromMatrix(center, a, b, L), size, overlapParams)
 	end
 
+	-- Which round surfaces get their dark side drawn. Cylinder sides are cheap even with parts
+	-- (each facet is one thin block); ball-like surfaces need many triangles, so with parts they
+	-- keep Roblox's own shading unless CurvedShading is true.
+	local function curvedShading(term)
+		local mode = CONFIG.CurvedShading
+		if mode == false then
+			return false
+		end
+		return mode == true or term.axis ~= nil or Render.meshOk
+	end
+
+	local DX, DY = {}, {}
+	-- The sides of a part that face away from the light are inside its own shadow volume.
 	local function emitBackFaces(state, shape)
 		local faces = getWorldFaces(state, shape)
+		local terms = shape.terms
+		local planes = nil
+		if terms then
+			-- where each round surface turns away from the light: a plane through its centre
+			planes = {}
+			local cf = state.part.CFrame
+			local dl = cf:VectorToObjectSpace(Light.dir)
+			for i, t in ipairs(terms) do
+				if curvedShading(t) then
+					local nl = t.axis and (dl - t.axis * t.axis:Dot(dl)) or dl * t.rinv2
+					planes[i] = {cf * t.c, cf:VectorToWorldSpace(nl)}
+				else
+					planes[i] = false
+				end
+			end
+		end
 		for i = 1, #faces do
 			local wf = faces[i]
-			if wf.s < MIN_LIT then
-				local lf = wf.lf
-				emitFace(wf, lf.xs, lf.ys, lf.count, false)
+			local lf = wf.lf
+			local ti = lf.term
+			if ti then
+				local plane = planes and planes[ti]
+				if plane then
+					-- cut the facet exactly where the real curve turns away (a smooth edge)
+					local nw = plane[2]
+					local A, B, C = wf.u:Dot(nw), wf.v:Dot(nw), (wf.o - plane[1]):Dot(nw)
+					local xs, ys, cnt = lf.xs, lf.ys, lf.count
+					local lit = 0
+					for k = 1, cnt do
+						if A * xs[k] + B * ys[k] + C >= 0 then
+							lit += 1
+						end
+					end
+					if lit == 0 then
+						emitFace(wf, xs, ys, cnt, false)
+					elseif lit < cnt then
+						local n = clipLine(xs, ys, cnt, -A, -B, -C, DX, DY)
+						if n >= 3 and polyArea(DX, DY, n) > MIN_AREA then
+							emitFace(wf, DX, DY, n, false)
+						end
+					end
+				end
+			elseif wf.s < MIN_LIT then
+				emitFace(wf, lf.exs, lf.eys, lf.ecount, false)
 			end
 		end
 	end
@@ -2716,7 +3250,7 @@ do
 					GEOMS[1] = nil
 				end
 			end
-			if CONFIG.ShadeBackFaces and shape.shade and not state.tint then
+			if CONFIG.ShadeBackFaces and shape.shade and not state.tint and not state.glow then
 				emitBackFaces(state, shape)
 			end
 		end
@@ -2735,13 +3269,19 @@ do
 			owner.casterRec = rec
 		end
 		resetOut()
+		owner.retry = false
 		if Light.valid then
 			local geoms, ng = {}, 0
 			local minX, maxX, minY, maxY, minZ, maxZ = huge, -huge, huge, -huge, huge, -huge
 			for i = 1, #members do
 				local st = members[i]
-				if st.isCaster and not st.dead then
-					local shape = getShape(st, lod)
+				-- ltmLevel: the camera is fading this body part out (1) or has hidden it (2, first person)
+				local fade = st.ltmLevel or 0
+				if st.isCaster and not st.dead and fade < 2 then
+					local shape, pending = getShape(st, lod)
+					if pending then
+						owner.retry = true -- its shape isn't known yet (raycasts are rationed): redo next frame
+					end
 					if shape then
 						local g = getGeom(st, shape, lod)
 						if g.hullCount >= 3 then
@@ -2751,7 +3291,7 @@ do
 							minY, maxY = min(minY, g.minY), max(maxY, g.maxY)
 							minZ, maxZ = min(minZ, g.minZ), max(maxZ, g.maxZ)
 						end
-						if CONFIG.ShadeBackFaces and shape.shade and not st.tint then
+						if CONFIG.ShadeBackFaces and shape.shade and not st.tint and not st.glow and fade == 0 then
 							emitBackFaces(st, shape)
 						end
 					end
@@ -2804,7 +3344,7 @@ do
 			local minX, maxX, minY, maxY, minZ, maxZ = huge, -huge, huge, -huge, huge, -huge
 			for i = 1, #members do
 				local st = members[i]
-				if st.isReceiver and not st.dead and st.part.LocalTransparencyModifier < 0.5 then
+				if st.isReceiver and not st.dead and (st.ltmLevel or 0) == 0 then
 					local shape = getShape(st, lod)
 					if shape and shape.faces then
 						local faces = getWorldFaces(st, shape)
@@ -2914,7 +3454,10 @@ do
 		local size = part.Size
 		local t = part.Transparency
 		local visible = t < 0.98 and max(size.X, size.Y, size.Z) >= CONFIG.MinPartSize and not state.ignored
-		state.isReceiver = visible
+		-- glowing (Neon) parts give off their own light: shadows don't darken them
+		local glow = CONFIG.GlowingPartsStayLit and part.Material == Enum.Material.Neon
+		state.glow = glow
+		state.isReceiver = visible and not glow
 		local caster = visible and (state.castShadow or not CONFIG.RespectCastShadow)
 		if caster and state.character and not CONFIG.CharacterShadows then
 			caster = false
@@ -3078,6 +3621,7 @@ do
 			if not info then
 				info = {model = model, members = {}, isLocal = false, dist = 0, sortDist = 0}
 				characters[model] = info
+				newCharacter = true -- read what it's wearing right away
 			end
 			info.members[#info.members + 1] = state
 			state.charInfo = info
@@ -3181,6 +3725,9 @@ do
 		state.shapeVersion += 1
 		state.geom = nil
 		evaluate(state)
+		if state.charInfo then
+			state.charInfo.dirty = true
+		end
 		if state.dynamic then
 			return
 		end
@@ -3200,7 +3747,7 @@ do
 
 	local MOVE_PROPS = {CFrame = true, Position = true, Orientation = true, Rotation = true}
 	local SHAPE_PROPS = {Size = true, Shape = true, MeshId = true, MeshContent = true}
-	local LOOK_PROPS = {Transparency = true, CastShadow = true, Color = true}
+	local LOOK_PROPS = {Transparency = true, CastShadow = true, Color = true, Material = true}
 
 	onPartChanged = function(state, prop)
 		if state.dead then
@@ -3418,15 +3965,54 @@ do
 		physCursor = i
 	end
 
+	local BODY_FIELDS = {"Torso", "LeftArm", "RightArm", "LeftLeg", "RightLeg"}
+
+	-- What the avatar is wearing: R6 package meshes (CharacterMesh) and, from the
+	-- HumanoidDescription, which R15 body parts are the default blocky ones (asset id 0).
+	local function readBody(model)
+		local meshes, blocky, sig = nil, nil, ""
+		for _, child in ipairs(model:GetChildren()) do
+			if child:IsA("CharacterMesh") then
+				meshes = meshes or {}
+				local name = child.BodyPart.Name
+				meshes[name] = true
+				sig = sig .. name .. ","
+			end
+		end
+		local hum = model:FindFirstChildOfClass("Humanoid")
+		local desc = hum and hum:FindFirstChildOfClass("HumanoidDescription")
+		if desc then
+			blocky = {}
+			sig = sig .. "|"
+			for _, field in ipairs(BODY_FIELDS) do
+				local ok, id = pcall(function()
+					return desc[field]
+				end)
+				if ok and id == 0 then
+					blocky[field] = true
+					sig = sig .. field .. ","
+				end
+			end
+		end
+		return meshes, blocky, sig
+	end
+
 	function refreshCharacters()
 		for model, info in pairs(characters) do
 			info.isLocal = LocalPlayer ~= nil and LocalPlayer.Character == model
+			local meshes, blocky, sig = readBody(model)
+			local bodyChanged = sig ~= info.bodySig
+			if bodyChanged then
+				info.bodySig, info.charMeshes, info.blocky = sig, meshes, blocky
+				info.dirty = true
+			end
 			for _, st in ipairs(info.members) do
 				local part = st.part
 				local size, t = part.Size, part.Transparency
-				if size ~= st.lastSize or t ~= st.lastT then
+				if bodyChanged or size ~= st.lastSize or t ~= st.lastT then
 					st.lastSize, st.lastT = size, t
 					st.shapeVersion += 1
+					st.geom = nil
 					st.castShadow = part.CastShadow
 					evaluate(st)
 					info.dirty = true
@@ -3521,6 +4107,7 @@ do
 		return built
 	end
 
+	-- Returns true when every queued chunk has been gone through.
 	local function processStatic(deadline)
 		while clock() < deadline do
 			local st = qpop(urgentQ)
@@ -3538,7 +4125,7 @@ do
 		while clock() < deadline do
 			local ch = staticQueue[staticHead]
 			if not ch then
-				return
+				return true
 			end
 			if not ch.active or not ch.needsScan then
 				staticHead += 1
@@ -3568,10 +4155,11 @@ do
 					staticHead += 1
 				else
 					ch.cursor = i
-					return
+					return false
 				end
 			end
 		end
+		return staticQueue[staticHead] == nil
 	end
 
 	local CHAR_LIST, MOVE_LIST = {}, {}
@@ -3619,10 +4207,19 @@ do
 		info.memberCount = #members
 		for i = 1, #members do
 			local st = members[i]
-			local cf = st.part.CFrame
+			local part = st.part
+			local cf = part.CFrame
 			local prev = last[st]
 			if not prev or not cf:FuzzyEq(prev, 1e-4) then
 				last[st] = cf
+				moved = true
+			end
+			-- zooming in fades your own character out (LocalTransparencyModifier) and hides it in
+			-- first person: its shadows go with it
+			local ltm = part.LocalTransparencyModifier
+			local level = ltm > 0.5 and 2 or (ltm > 0.02 and 1 or 0)
+			if level ~= (st.ltmLevel or 0) then
+				st.ltmLevel = level
 				moved = true
 			end
 		end
@@ -3658,7 +4255,7 @@ do
 			if CONFIG.CharacterShadows and casting < CONFIG.MaxCharacters and info.dist <= CONFIG.DynamicDistance then
 				casting += 1
 				local rec = info.casterRec
-				if inBudget and (moved or not rec or rec.lightVersion ~= Light.version or rec.lod ~= lod) then
+				if inBudget and (moved or info.retry or not rec or rec.lightVersion ~= Light.version or rec.lod ~= lod) then
 					safeCall(buildDynamicCaster, info, info.members, lod)
 				end
 			elseif info.casterRec then
@@ -3728,7 +4325,7 @@ do
 			if moving < CONFIG.MaxMovingShadows and d <= CONFIG.DynamicDistance then
 				moving += 1
 				local rec = grp.casterRec
-				local changed = grp.sig ~= grp.builtSig or grp.ids ~= grp.builtIds
+				local changed = grp.sig ~= grp.builtSig or grp.ids ~= grp.builtIds or grp.retry
 				if (changed or not rec or rec.lightVersion ~= Light.version or rec.lod ~= lod) and clock() < deadline then
 					safeCall(buildDynamicCaster, grp, grp.members, lod)
 					grp.builtSig, grp.builtIds = grp.sig, grp.ids
@@ -3755,21 +4352,24 @@ do
 		end
 	end
 
-	function step(dt)
+	-- One frame of work. budgetMs / warm are used by the start-up pause, which runs this over and
+	-- over with a big budget. Returns true when everything in range has been built.
+	function step(dt, budgetMs, warm)
 		frameId += 1
 		local now = clock()
-		RaySample.budget = 3
+		RaySample.budget = warm and 40 or 3
 		local loading = not initialScanDone or staticHead <= #staticQueue
-		local budget = (loading and dt < 1 / 40) and CONFIG.LoadingBudget or CONFIG.FrameBudget
+		local budget = budgetMs or ((loading and dt < 1 / 40) and CONFIG.LoadingBudget or CONFIG.FrameBudget)
 		local deadline = now + budget / 1000
+		local settled = initialScanDone and not warm
 
 		processRemovals()
 		processCharacterChanges()
-		processAdds(initialScanDone and now + 0.0015 or deadline, initialScanDone and 500 or CONFIG.RegisterPerFrame)
+		processAdds(settled and now + 0.0015 or deadline, settled and 500 or CONFIG.RegisterPerFrame)
 		processChanges(now)
 		processMeshReady()
 		if not enabled then
-			return
+			return true
 		end
 
 		if now - lastTerrainCheck > 10 then
@@ -3794,28 +4394,31 @@ do
 		end
 		Render.setVisible(Light.valid)
 		if not Light.valid then
-			return
+			return true
 		end
 
 		local camera = Workspace.CurrentCamera
 		local camPos = camera and camera.CFrame.Position or ZERO
 		pollPhysics(now)
-		if now - lastCharacterRefresh > 0.5 then
+		if newCharacter or now - lastCharacterRefresh > 0.5 then
+			newCharacter = false
 			lastCharacterRefresh = now
 			refreshCharacters()
 		end
-		if refreshSoon or now - lastRefresh > 0.25 then
+		if warm or refreshSoon or now - lastRefresh > 0.25 then
 			refreshSoon = false
 			lastRefresh = now
 			refreshChunks(camPos)
 		end
 		processDynamic(camPos, now, deadline)
+		local staticDone = false
 		if initialScanDone then
 			processUpstream(deadline)
-			processStatic(deadline)
+			staticDone = processStatic(deadline)
 		end
 		Render.flush(now)
 		stats.frameMs = (clock() - now) * 1000
+		return staticDone and urgentQ.head > urgentQ.tail and upstreamQ.head > upstreamQ.tail
 	end
 end
 
@@ -3837,7 +4440,9 @@ local function setEnabled(on)
 	end
 	enabled = on
 	Render.setVisible(on and Light.valid)
-	applyRobloxShadows(on)
+	if started then -- before that, the start-up pause swaps the shadows over when it's done
+		applyRobloxShadows(on)
+	end
 end
 
 local API = {Config = CONFIG}
@@ -3947,7 +4552,66 @@ local function onDescendantRemoving(inst)
 	end
 end
 
+-- The start-up pause: nothing is shown until everything near the player has been built. The game
+-- simply freezes for a moment while that happens (no loading screen). The freeze is cut into
+-- slices of LoadPauseSlice seconds with one frame in between, so Roblox never stops the script for
+-- running too long, and it never lasts longer than LoadPauseMax.
+local function loadPause()
+	pcall(function()
+		if not game:IsLoaded() then
+			game.Loaded:Wait()
+		end
+	end)
+	-- wait for our character to spawn, so the area around it is what gets built
+	local waited = 0
+	while alive and LocalPlayer and not LocalPlayer.Character and waited < 10 do
+		waited += task.wait(0.1)
+	end
+	if LocalPlayer and LocalPlayer.Character then
+		task.wait(0.2) -- the camera moves to the character
+	end
+	if not alive or not enabled then
+		return
+	end
+	holdHidden = true
+	local t0 = clock()
+	local stop = t0 + CONFIG.LoadPauseMax
+	while alive and enabled do
+		local sliceEnd = min(clock() + CONFIG.LoadPauseSlice, stop)
+		local done = false
+		repeat
+			local ok, res = pcall(step, 1 / 60, max(1, (sliceEnd - clock()) * 1000), true)
+			if ok then
+				done = res
+			else
+				errorCount += 1
+				warn("[StencilShadows] " .. tostring(res))
+				done = true
+			end
+		until done or clock() >= sliceEnd
+		if done or clock() >= stop then
+			break
+		end
+		RunService.Heartbeat:Wait() -- let one frame through, then carry on
+	end
+	stats.loadPauseMs = (clock() - t0) * 1000
+	holdHidden = false
+end
+
 local function mainLoop()
+	if enabled and CONFIG.LoadPause then
+		local ok, err = pcall(loadPause)
+		holdHidden = false
+		if not ok then
+			warn("[StencilShadows] " .. tostring(err))
+		end
+	end
+	started = true
+	if alive and enabled then
+		-- Roblox's shadows go off at the same moment the stencil shadows appear
+		applyRobloxShadows(true)
+		Render.setVisible(Light.valid)
+	end
 	while alive do
 		local dt = RunService.Heartbeat:Wait()
 		if not alive then
@@ -3990,7 +4654,7 @@ connect(UserInputService.InputBegan, function(input, processed)
 end)
 connect(Lighting:GetPropertyChangedSignal("GlobalShadows"), function()
 	-- something else switched Roblox shadows back on: remember that, keep them off while enabled
-	if alive and enabled and CONFIG.DisableRobloxShadows and Lighting.GlobalShadows then
+	if alive and enabled and started and CONFIG.DisableRobloxShadows and Lighting.GlobalShadows then
 		savedGlobalShadows = true
 		pcall(function()
 			Lighting:SetAttribute(SAVED_SHADOWS_ATTR, true)
@@ -4009,10 +4673,7 @@ do
 	addQ.items, addQ.head, addQ.tail = all, 1, #all
 end
 
-if enabled then
-	applyRobloxShadows(true)
-end
-Render.setVisible(false) -- shown once the light has been read
+Render.setVisible(false) -- shown after the start-up pause, once the light has been read
 
 _G.StencilShadows = API
 _G.__StencilShadowsCleanup = shutdown

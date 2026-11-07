@@ -23,13 +23,28 @@ Script: [`src/StencilShadows.client.luau`](src/StencilShadows.client.luau)
   - Mesh shadows use the real triangles when the mesh can be read, so concave shapes such as arches
     and L-shapes keep their holes.
   - If a mesh can't be read, its outline is sampled with raycasts instead.
-  - Characters cast too, including tools and accessories.
+- **Characters cast their real shape**, R6 and R15, with packages, hats, hair and tools.
+  - Avatar meshes are read when the game allows it, or sampled with raycasts when the avatar has
+    real collision shapes.
+  - Most games give avatars only box collisions and don't let meshes be read. Then each body part
+    becomes a block with rounded edges that fills the part's real size. The shadow keeps the
+    avatar's build instead of becoming boxes or a stick figure.
+  - Default blocky bodies (R6, and R15 with the default body) are real boxes and are drawn exactly.
+  - Nothing is drawn on an avatar part whose exact shape isn't known, so no dark cubes stick out
+    of the player.
+  - Zoomed into first person, your own character's shadows disappear along with it, as they do
+    with Roblox's shadows.
 - **Shadows land on everything behind the caster.**
   - That includes floors, walls, roofs, slopes, round parts, meshes, terrain, and other players.
   - A shadow continues from the floor up a wall and over a box, and is cut exactly at each
     surface's edge.
   - The sides of parts that face away from the sun are darkened too, as they were inside the old
     shadow volumes.
+  - Shadows on two faces that meet at an edge meet exactly, with no thin lit line between them.
+  - On balls, cylinders and capsules the dark side sits just off the real curve and ends in a smooth
+    line exactly where the surface turns away from the sun. It doesn't float off the part or follow
+    blocky facets.
+  - Glowing (Neon) parts give off light, so shadows don't darken them.
 - **Moving things update every frame.**
   - Characters, unanchored parts, vehicles (one shadow job per assembly), and tweened parts all
     update.
@@ -37,10 +52,13 @@ Script: [`src/StencilShadows.client.luau`](src/StencilShadows.client.luau)
 - **Shadows on moving things.** A player walking under a roof gets the roof's shadow on them. Loose
   parts get shadows drawn on them too.
 - **Sun and moon.** Shadows follow the sun, or the moon at night. When neither is up they hide.
-- **Loads without freezing the game.**
-  - The map is read in time-limited slices and grouped into chunks.
-  - Shadows are built nearest-first within a per-frame budget (`FrameBudget`, 4.2 ms by default).
-  - Faraway shadows use simpler curves.
+- **A short pause at the start, then everything at once.** There is no loading screen. The game
+  waits for your character, then freezes for a moment while every shadow near you is built. Then
+  all of them appear in the same frame that Roblox's own shadows switch off.
+  - The freeze comes in slices of `LoadPauseSlice` seconds with one frame between them, so Roblox
+    never stops the script for running too long. It never lasts more than `LoadPauseMax` seconds.
+  - After that, new parts are built nearest-first within a per-frame budget (`FrameBudget`, 4.2 ms
+    by default), and faraway shadows use simpler curves.
 - **Toggle** with 9. Turning it off hides the shadows and restores `Lighting.GlobalShadows`.
 
 ## Settings
@@ -54,6 +72,10 @@ Everything is in the `CONFIG` table at the top of the script. The most useful se
 | `ShadowDistance` | `520` | Map shadows are kept within this many studs of the camera. |
 | `PartsShadowDistance` | `300` | The same, when drawing with parts because EditableMesh is off. |
 | `ShadeBackFaces` | `true` | Darken the sides of parts that face away from the sun. |
+| `CurvedShading` | `"Auto"` | Smooth dark sides on round parts. `"Auto"` does all round parts with EditableMesh, and only cylinders when drawing with parts, because balls would need too many parts. |
+| `GlowingPartsStayLit` | `true` | Neon parts are never darkened. |
+| `LoadPause` | `true` | Freeze briefly at the start so all nearby shadows appear at once (no loading screen). |
+| `LoadPauseMax` | `5` | The longest the start-up pause may last, in seconds. |
 | `TransparentShadows` | `false` | See-through parts cast lighter shadows tinted with their color. |
 | `MinShadowElevation` | `8` | A sun lower than this many degrees is raised, so shadows don't stretch forever. |
 | `MaxShadowLength` | `200` | How far past its caster a shadow can reach. |
@@ -65,7 +87,8 @@ Everything is in the `CONFIG` table at the top of the script. The most useful se
 On phones, lower `ShadowDistance` and `FrameBudget` if the game feels heavy.
 
 Other scripts can control it through `_G.StencilShadows`: `SetEnabled(bool)`, `Toggle()`,
-`IsEnabled()`, `Rebuild()`, `GetStats()` and `Destroy()`.
+`IsEnabled()`, `Rebuild()`, `GetStats()` and `Destroy()`. `GetStats().backend` says whether shadows
+are drawn with `"EditableMesh"` or `"Parts"`.
 
 ## How it works
 
@@ -87,6 +110,36 @@ Other scripts can control it through `_G.StencilShadows`: `SetEnabled(bool)`, `T
    when far away. Moving parts and characters have their own per-frame jobs. When a surface moves or
    is removed, the shadows drawn on it are rebuilt right away.
 
+## Indoors: how the old stencil shadows behaved
+
+Sources:
+
+- Roblox's 2012 engineering blog post
+  ["Shadows on ROBLOX: Past, Present, and Future"](https://blogarchive.pages.dev/2012/10/shadows-on-roblox-past-present-and-future)
+  describes the old shadow as "a darkened shadow with pixel-perfect edges", "essentially an extruded
+  version of an object that darkens everything within it".
+- The [Ogre 3D manual](https://www.ogre3d.org/docs/manual.old/manual_73.html) covers the engine
+  family these shadows came from. It says this kind of shadow works "by darkening an already
+  rendered scene with a fixed colour", and that it darkens "the areas of shadow uniformly,
+  irrespective of the amount of light which would have fallen on the shadow area anyway".
+
+What that means inside a building:
+
+- **The roof's shadow covers the whole room.** Everything under it sits inside one shadow volume,
+  so floors, walls, furniture and players all get the same, even darkening. A flat, evenly grey
+  interior is what real stencil shadows look like.
+- **Shadows inside don't stack.** A player's shadow on a floor that is already in the roof's shadow
+  doesn't show, because a spot is either in shadow or not.
+- **Sunlight through windows and doors makes sharp bright patches.** These are the only lit areas
+  indoors, and the script draws them because every wall and roof part casts its exact shape.
+- **Lamps can't light up shadows.** The darkening is one fixed colour over everything. Old Roblox
+  had no lamps, but in today's games (horror games especially) lamps indoors get dimmed along with
+  the rest. Glowing Neon parts are left bright.
+- **Roblox's own lighting goes off.** Many games make interiors dark with Roblox's own shadows,
+  which this script turns off (`DisableRobloxShadows`) so they don't double up outdoors. If you'd
+  rather keep a game's own dark interiors, set it to `false`, but then outdoor shadows get darker
+  where both overlap.
+
 ## Known limits
 
 - **Parts with `CanQuery` off don't receive shadows.** The surface search uses spatial queries, which
@@ -100,20 +153,32 @@ Other scripts can control it through `_G.StencilShadows`: `SetEnabled(bool)`, `T
   - MeshParts only receive shadows on their own surface when their mesh can be read and is small
     enough (`MeshReceiverTriangles`).
   - Otherwise, flat meshes and unions use their bounding box.
-  - R15 body parts receive shadows only when their mesh can be read; blocky R6 bodies always do.
+  - Package avatar parts don't take shadows or get dark sides unless their exact shape is known.
+    Blocky bodies and the classic head do.
+- **Avatar shapes.** Most games don't let scripts read avatar meshes and give avatars box
+  collisions, so package avatars cast rounded blocks of each part's real size. That's close, but
+  not the exact mesh outline.
+- **Jagged edges on phones.** Roblox draws Highlights without anti-aliasing, so shadow edges look a
+  little pixelated, mostly on mobile
+  ([DevForum feature request](https://devforum.roblox.com/t/anti-aliasing-for-highlight-instances/1862811)).
+  `RenderStyle = "Direct"` gives smooth edges, but overlapping shadows then get darker.
+- **Balls drawn with parts.** Without EditableMesh, the dark side of a ball keeps Roblox's own
+  shading, because drawing it would take hundreds of parts per ball. Cylinders still get theirs.
 - **Light sources.** Only the sun and the moon cast shadows, not PointLights or SpotLights.
-- **Not yet run in Roblox.** The script was checked with a Luau parser and linter, and with the
-  26-scenario simulation suite described below. Two things can only be confirmed in a real game:
-  how the Highlight draws on 99.9% transparent parts, and EditableMesh memory budgets on your
-  devices.
+- **Tested in a real game on a phone** by the requester. This version fixes what that showed: the
+  avatar shadow, cubes on the player, thin lines along edges, round parts, first person, and the
+  start-up. The fixes themselves were checked with the Luau parser, linter and simulation suite
+  below, not in Roblox.
 
 ## Testing
 
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 26 scenarios compare the shadow triangles it draws against independently computed projections.
+The 37 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover every shape, clipping, sunk casters, moving and resting parts, vehicles, removal,
-characters (R6 and R15), the toggle key, the wedge-part fallback, exact concave meshes, ray-sampled
-meshes, terrain, sun, moon and night, oversized shadows split across pages, tight time budgets,
-streaming, EditableMesh memory running out, and failed mesh loads.
+characters (R6, R15, packages, blocky bodies, the classic head, first person), the toggle key, the
+wedge-part fallback, exact concave meshes, ray-sampled meshes, terrain, sun, moon and night,
+oversized shadows split across pages, tight time budgets, streaming, EditableMesh memory running
+out, failed mesh loads, edges meeting without gaps, round parts without gaps or floating, Neon
+parts, and the start-up pause.
