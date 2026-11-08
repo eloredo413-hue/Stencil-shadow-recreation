@@ -3333,6 +3333,8 @@ do
 	local dirtyPages = {}
 	local allPages = {}
 
+	local SMOOTH = Enum.SurfaceType.Smooth
+
 	local function styleShadowPart(p, layer)
 		p.Anchored = true
 		p.CanCollide = false
@@ -3344,11 +3346,36 @@ do
 		p.Material = layer.material
 		p.Color = layer.color
 		p.Transparency = layer.transparency
+		-- retro stud scripts put stud textures on every part whose surfaces aren't smooth: a
+		-- shadow has smooth surfaces, and is put on such a script's list of parts it has done
+		p.TopSurface, p.BottomSurface = SMOOTH, SMOOTH
+		p.FrontSurface, p.BackSurface = SMOOTH, SMOOTH
+		p.LeftSurface, p.RightSurface = SMOOTH, SMOOTH
+		local done = rawget(_G, "RetroTrackedParts")
+		if type(done) == "table" then
+			done[p] = true
+		end
 	end
+
+	-- Shadows stay plain shadows: a texture or decal another script puts on one of them (studs
+	-- from a retro stud script, say) is taken off again.
+	local function keepPlain(model)
+		connect(model.DescendantAdded, function(d)
+			if d:IsA("Decal") then -- (a Texture is a Decal too)
+				task.defer(function()
+					if d.Parent then
+						pcall(d.Destroy, d)
+					end
+				end)
+			end
+		end)
+	end
+	Render.keepPlain = keepPlain
 
 	local function makeLayer(name, containerName, highlight, transparency, material, color)
 		local model = Instance.new("Model")
 		model.Name = containerName
+		keepPlain(model)
 		if highlight then
 			-- A Humanoid makes the Highlight draw on these 99.9% transparent parts.
 			local hum = Instance.new("Humanoid")
@@ -5956,6 +5983,7 @@ do
 		if h == nil or h.Parent == nil then
 			h = Instance.new("Model")
 			h.Name = SILHOUETTE_NAME
+			Render.keepPlain(h)
 			h.Parent = Workspace
 			Silhouette.holder = h
 		end

@@ -151,6 +151,12 @@ There are two scripts. They are the same script with one setting changed:
     about 3.5 times faster, with exactly the same shadows.)
 - **Building tools work.** Parts spawned, cloned, dragged, resized or deleted (BTools, F3X, scripts)
   get their shadows updated by the next frame.
+- **Works next to retro texture scripts.** Stud scripts (like the "Fast Textures" addon for the
+  Bloxy Paradox project) put a stud texture on every part whose surfaces aren't smooth, and some
+  retro scripts give every new part studded surfaces. Shadows stay plain: every shadow piece has
+  smooth surfaces, goes on the stud script's list of parts it has already done
+  (`_G.RetroTrackedParts`), and any texture or decal another script puts on a shadow is taken off
+  again.
 - **Moving things update every frame**: characters, unanchored parts, vehicles (one shadow job per
   assembly) and tweened parts. You, the nearest other player and the two nearest moving things are
   redrawn every frame they move, however little time there is to spare, so their shadows never
@@ -340,7 +346,7 @@ What that means inside a building:
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 89 scenarios compare the shadow triangles it draws against independently computed projections.
+The 90 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover:
 
 - Every shape, clipping, parts sunk into the floor, shadows falling 450 studs.
@@ -375,6 +381,7 @@ They cover:
   hiding with its button, and going once loading is complete.
 - The no-shadows notice's Yes and No buttons.
 - Loading a town of 800 parts without a single box query (the light-space grid).
+- A stud script's textures kept off the shadows.
 - A blocky player whose limbs have box meshes casting boxes, whether the meshes can be traced or
   not, and a package limb that only traces as a box casting a rounded stand-in.
 - Walking around a kept map: only shadows that depend on the level of detail are rebuilt.
