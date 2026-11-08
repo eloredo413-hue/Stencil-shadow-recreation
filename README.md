@@ -76,15 +76,23 @@ There are two scripts. They are the same script with one setting changed:
   anti-aliasing, so their edges look jagged on phones.
 - **Roblox's own shadows stay off.** `Lighting.GlobalShadows` goes off while the stencil shadows
   are on, and so does `Shadows` on lamps (PointLight, SpotLight, SurfaceLight), so Roblox's soft
-  shadows never lie on top of these. If the game switches either back on, it goes off again. Key 9
-  (or removing the script) gives everything back.
-- **The whole map at once.** There is no loading screen. The game waits for your character, then
-  freezes while the shadows are built, then all of them appear in the same frame that Roblox's own
-  shadows switch off.
-  - Maps up to 12,000 parts (4,000 when drawing with parts) are built completely and kept, so
-    nothing loads while you walk around. The pause may last up to `WholeMapPauseMax` seconds.
-  - Bigger maps build what's near you, then load the rest as you go.
-  - The freeze comes in slices with one frame between them, so Roblox never stops the script.
+  shadows never lie on top of these. This happens the moment the script starts. If the game
+  switches either back on, it goes off again (checked every second as well). Key 9 (or removing the
+  script) gives everything back.
+- **Only where Roblox would have a shadow.** Parts with `CastShadow` off, see-through parts,
+  ForceField parts, and parts a game hides on your screen only (`LocalTransparencyModifier`, like a
+  roof that fades when you walk in) cast nothing.
+- **Shadows load right away, nearest first.** There is no start-up pause and no loading screen;
+  the shadows near you appear within the first moments and the rest follow as you walk. (The
+  start-up pause and whole-map loading from earlier versions are still there as `LoadPause` and
+  `LoadWholeMap`, off: they made the game laggy.)
+  - Floors made of parts with `CanQuery` off (often roads, decorations, or a visible floor over an
+    invisible one) take shadows too. Roblox's spatial queries skip such parts, so the script keeps
+    a grid of its own for them.
+  - If a part's shadow fails to build (something unusual about it), it's tried again a few seconds
+    later instead of being skipped for good.
+  - On phones and tablets the script uses less time each frame (`MobileFrameBudget`), and the
+    bigger loading budget is only used in the first seconds.
 - **Building tools work.** Parts spawned, cloned, dragged, resized or deleted (BTools, F3X, scripts)
   get their shadows updated by the next frame.
 - **Moving things update every frame**: characters, unanchored parts, vehicles (one shadow job per
@@ -117,8 +125,8 @@ All settings are in the `CONFIG` table at the top of the script.
 | `DynamicLights` | `false` (`true` in the 2013 edition) | Lamps light up shadows and cast their own there. |
 | `LightPoolSize` | `0.6` | How much of a lamp's Range takes the shadow away fully. |
 | `LightFade` | `true` | A ring at half darkness around each pool of light. |
-| `LoadPause` | `true` | Freeze at the start so all shadows appear at once (no loading screen). |
-| `LoadWholeMap` | `true` | Build the whole map in that pause and keep it, unless the map is bigger than the limits below. |
+| `LoadPause` | `false` | Freeze at the start until nearby shadows are built (off: it made joining laggy). |
+| `LoadWholeMap` | `false` | Build the whole map in that pause and keep it, unless the map is bigger than the limits below. |
 | `WholeMapParts` | `12000` | Most parts for a whole-map load with EditableMesh. |
 | `PartsWholeMapParts` | `4000` | The same when drawing with parts. |
 | `WholeMapPauseMax` | `20` | The longest the pause may last for a whole map, in seconds (`LoadPauseMax`, 5, otherwise). |
@@ -136,9 +144,11 @@ All settings are in the `CONFIG` table at the top of the script.
 | `MaxShadowLength` | `600` | How far past its caster a shadow can reach. |
 | `Backend` | `"Auto"` | `"EditableMesh"`, `"Parts"`, or automatic. |
 | `FrameBudget` | `4.2` | Milliseconds of shadow work per frame. |
+| `MobileFrameBudget` | `2.5` | The same on phones and tablets. |
+| `LoadingTime` | `8` | Seconds after the start during which `LoadingBudget` (9 ms) may be used. |
 | `IgnoreAttribute` | `"NoStencilShadow"` | Set this attribute to `true` on a part or model to leave it out. |
 
-On phones, lower `FrameBudget` (or `PartsWholeMapParts`) if the game feels heavy.
+On phones, lower `MobileFrameBudget` or `PartsShadowDistance` if the game still feels heavy.
 
 Other scripts can control it through `_G.StencilShadows`: `SetEnabled(bool)`, `Toggle()`,
 `IsEnabled()`, `Rebuild()`, `GetStats()` and `Destroy()`. `GetStats().backend` says whether shadows
@@ -167,9 +177,9 @@ are drawn with `"EditableMesh"` or `"Parts"`, and `GetStats().wholeMap` whether 
    plane is worked out (a disc, cut to the cone for spot and surface lights). The pool is cut out
    of the shadow, except where a part between the lamp and the surface casts a shadow from the
    lamp (projected from the lamp's position).
-6. **Scheduling.** Still parts are bucketed into 64-stud chunks. On maps that aren't huge, every
-   chunk is built in the start-up pause and kept. Otherwise chunks load nearest-first and unload
-   when far away. Moving parts and characters have their own per-frame jobs.
+6. **Scheduling.** Still parts are bucketed into 64-stud chunks that load nearest-first and unload
+   when far away (with `LoadWholeMap` on, small maps are built in the start-up pause and kept).
+   Moving parts and characters have their own per-frame jobs.
 
 ## Indoors: how the old stencil shadows behaved
 
@@ -201,8 +211,8 @@ What that means inside a building:
 
 ## Known limits
 
-- **Parts with `CanQuery` off don't receive shadows.** The surface search uses spatial queries, which
-  skip them. They still cast.
+- **Parts with `CanQuery` off** take and cast shadows, but the raycast checks (whether a player
+  stands in shade, whether a spot is lit) don't see them.
 - **Direct style.**
   - Shadows on terrain, and shadows from several parts landing on a character, can still overlap
     and look darker there.
@@ -239,7 +249,7 @@ What that means inside a building:
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 68 scenarios compare the shadow triangles it draws against independently computed projections.
+The 73 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover:
 
 - Every shape, clipping, parts sunk into the floor, shadows falling 450 studs.
@@ -260,8 +270,11 @@ They cover:
   spot and surface lights lighting only their cone, a player in a lamp's light), the classic script
   ignoring them, and lamps' own Roblox shadows switched off and back on with key 9.
 - Walking around a kept map: only shadows that depend on the level of detail are rebuilt.
-- The start-up pause, whole-map loading (far islands built before the pause ends, nothing loading
-  while flying around), and huge maps still streaming.
+- No pause by default (shadows and Roblox's shadows switched off from the first frames), Roblox's
+  shadows switched back off within a second when a script sneaks them on, floors with `CanQuery`
+  off taking shadows, ForceField and locally hidden parts casting nothing, the silhouette coming
+  back after a game clears the PlayerGui; and, switched on, the start-up pause, whole-map loading
+  and huge maps still streaming.
 - The wedge-part fallback, exact concave meshes, ray-sampled meshes, terrain, sun, moon and night,
   oversized shadows split across pages, tight time budgets, streaming, EditableMesh memory running
   out, failed mesh loads, edges meeting without gaps, and Neon parts.

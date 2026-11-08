@@ -17,11 +17,11 @@
 	   shadows overlap on a surface one is cut away, so nothing is ever darker than one shadow -
 	   which is exactly what made stencil shadows look the way they did. ("Highlight" instead
 	   merges everything with one Highlight, whose edges look jagged on phones.)
-	 * At the start the game pauses for a moment (no loading screen) while the shadows are built
-	   - the whole map, unless it's huge - then they all appear at once. Moving parts, vehicles
-	   and characters are rebuilt whenever they move. Shadows also land on players and loose
-	   parts, drape over terrain, and the sides of parts that face away from the light are dark,
-	   as if inside the old shadow volumes.
+	 * Shadows near you appear right away and the rest load as you walk (nearest first, inside a
+	   small per-frame time budget). Moving parts, vehicles and characters are rebuilt whenever
+	   they move. Shadows also land on players and loose parts, drape over terrain, and the sides
+	   of parts that face away from the light are dark, as if inside the old shadow volumes.
+	   Only parts Roblox would give a shadow cast one (CastShadow on, not see-through or hidden).
 	 * Characters cast their exact silhouette on flat floors (a black copy seen from the light),
 	   and real avatar outlines elsewhere. Their dark sides come from copies of their meshes
 	   (dynamic heads and hair too); a character fully in shade is darkened by one Highlight.
@@ -116,7 +116,9 @@ local CONFIG = {
 
 	-- Performance -------------------------------------------------------------------------------
 	FrameBudget = 4.2,                    -- milliseconds of work per frame
-	LoadingBudget = 9,                    -- milliseconds per frame while shadows are still loading
+	MobileFrameBudget = 2.5,              -- the same on phones and tablets (they have less to spare)
+	LoadingBudget = 9,                    -- milliseconds per frame in the first seconds after start
+	LoadingTime = 8,                      -- ...that many seconds (not every time new areas load)
 	RegisterPerFrame = 4000,              -- instances scanned per frame at startup (also time-limited)
 	PollPerFrame = 250,                   -- resting unanchored parts checked for movement per frame
 
@@ -124,11 +126,11 @@ local CONFIG = {
 	DisableRobloxShadows = true,          -- Lighting.GlobalShadows is off while this is enabled
 
 	-- Start-up ----------------------------------------------------------------------------------
-	LoadPause = true,                     -- freeze the game for a moment at the start (no loading
-	                                      -- screen) so every nearby shadow appears at once
+	LoadPause = false,                    -- freeze the game at the start until nearby shadows are
+	                                      -- built (off: it made the start laggy)
 	LoadPauseMax = 5,                     -- seconds the start-up pause may last at most
 	LoadPauseSlice = 1.2,                 -- it freezes in slices this long, with one frame between
-	LoadWholeMap = true,                  -- maps up to the size below are built completely during
+	LoadWholeMap = false,                 -- maps up to the size below are built completely during
 	                                      -- the pause and kept: nothing loads while you walk around
 	                                      -- (bigger maps load around you as you go)
 	WholeMapParts = 12000,                -- most parts for a whole-map load with EditableMesh...
@@ -2469,6 +2471,112 @@ end
 -- Output: the shadow polygons produced by one job (world space)
 ----------------------------------------------------------------------------------------------------
 local Lamps = {active = false, rec = nil, version = 0}
+-- Still parts with CanQuery off (spatial queries skip them), on a coarse grid of their own.
+local NoQuery = {count = 0, cells = {}, where = {}}
+do
+	local CELL = 64
+	local function cellsOf(part)
+		local cf, size = part.CFrame, part.Size
+		local half = (cf.RightVector * size.X):Abs() + (cf.UpVector * size.Y):Abs() + (cf.LookVector * size.Z):Abs()
+		local lo, hi = cf.Position - half * 0.5, cf.Position + half * 0.5
+		return lo, hi
+	end
+
+	function NoQuery.remove(part)
+		local keys = NoQuery.where[part]
+		if not keys then
+			return
+		end
+		NoQuery.where[part] = nil
+		NoQuery.count -= 1
+		for _, key in ipairs(keys) do
+			local cell = NoQuery.cells[key]
+			if cell then
+				cell[part] = nil
+				if next(cell) == nil then
+					NoQuery.cells[key] = nil
+				end
+			end
+		end
+	end
+
+	function NoQuery.update(state)
+		local part = state.part
+		NoQuery.remove(part)
+		if state.dead or state.dynamic or not state.isReceiver or part.CanQuery then
+			return
+		end
+		local lo, hi = cellsOf(part)
+		local keys = {}
+		local x0, x1 = floor(lo.X / CELL), floor(hi.X / CELL)
+		local y0, y1 = floor(lo.Y / CELL), floor(hi.Y / CELL)
+		local z0, z1 = floor(lo.Z / CELL), floor(hi.Z / CELL)
+		if (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1) > 4096 then
+			-- (huge: kept in one list that's always looked at)
+			x0, x1, y0, y1, z0, z1 = 0, 0, 0, 0, 0, 0
+			keys[1] = "huge"
+		else
+			for x = x0, x1 do
+				for y = y0, y1 do
+					for z = z0, z1 do
+						keys[#keys + 1] = x .. "," .. y .. "," .. z
+					end
+				end
+			end
+		end
+		for _, key in ipairs(keys) do
+			local cell = NoQuery.cells[key]
+			if not cell then
+				cell = {}
+				NoQuery.cells[key] = cell
+			end
+			cell[part] = true
+		end
+		NoQuery.where[part] = keys
+		NoQuery.count += 1
+	end
+
+	-- Parts with CanQuery off whose bounds touch a box (CFrame + size).
+	function NoQuery.inBox(cf, size)
+		local half = (cf.RightVector * size.X):Abs() + (cf.UpVector * size.Y):Abs() + (cf.LookVector * size.Z):Abs()
+		local lo, hi = cf.Position - half * 0.5, cf.Position + half * 0.5
+		local out, seen = {}, {}
+		local function take(cell)
+			for part in pairs(cell) do
+				if not seen[part] then
+					seen[part] = true
+					local plo, phi = cellsOf(part)
+					if phi.X >= lo.X and plo.X <= hi.X and phi.Y >= lo.Y and plo.Y <= hi.Y and phi.Z >= lo.Z and plo.Z <= hi.Z then
+						out[#out + 1] = part
+					end
+				end
+			end
+		end
+		if NoQuery.cells.huge then
+			take(NoQuery.cells.huge)
+		end
+		local x0, x1 = floor(lo.X / CELL), floor(hi.X / CELL)
+		local y0, y1 = floor(lo.Y / CELL), floor(hi.Y / CELL)
+		local z0, z1 = floor(lo.Z / CELL), floor(hi.Z / CELL)
+		if (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1) > 20000 then
+			for _, cell in pairs(NoQuery.cells) do
+				take(cell)
+			end
+			return out
+		end
+		for x = x0, x1 do
+			for y = y0, y1 do
+				for z = z0, z1 do
+					local cell = NoQuery.cells[x .. "," .. y .. "," .. z]
+					if cell then
+						take(cell)
+					end
+				end
+			end
+		end
+		return out
+	end
+end
 local Out = {pts = {}, sizes = {}, tints = {}, np = 0, nPoly = 0, cores = {}, nCores = 0}
 
 do
@@ -2512,8 +2620,13 @@ do
 	emitPlain = emitRaw
 
 	function emitFace(wf, xs, ys, n, tint)
-		if Lamps.active and (not tint or tint == "round") and Lamps.carve(wf, xs, ys, n, emitRaw, tint) then
-			return -- lamps light some of it up (see Lamps)
+		if Lamps.active and (not tint or tint == "round") then
+			local mark, markPts = Out.nPoly, Out.np
+			local ok, done = pcall(Lamps.carve, wf, xs, ys, n, emitRaw, tint)
+			if ok and done then
+				return -- lamps light some of it up (see Lamps)
+			end
+			Out.nPoly, Out.np = mark, markPts -- (if it failed halfway, drop what it drew)
 		end
 		emitRaw(wf, xs, ys, n, tint)
 	end
@@ -3858,7 +3971,20 @@ do
 		local a, b, L = Light.a, Light.b, Light.L
 		local center = a * ((minX + maxX) * 0.5) + b * ((minY + maxY) * 0.5) + L * ((minZ + maxZ) * 0.5)
 		local size = V3(max(maxX - minX, 0.05), max(maxY - minY, 0.05), max(maxZ - minZ, 0.05))
-		return Workspace:GetPartBoundsInBox(CFrame.fromMatrix(center, a, b, L), size, overlapParams)
+		local box = CFrame.fromMatrix(center, a, b, L)
+		local found = Workspace:GetPartBoundsInBox(box, size, overlapParams)
+		if NoQuery.count > 0 then
+			-- parts with CanQuery off aren't found by that: floors made of them still get shadows
+			local extra = NoQuery.inBox(box, size)
+			if #extra > 0 then
+				local list = table.clone(found)
+				for _, p in ipairs(extra) do
+					list[#list + 1] = p
+				end
+				return list
+			end
+		end
+		return found
 	end
 
 	-- Which round surfaces get their dark side drawn. Cylinder sides are cheap even with parts
@@ -4111,7 +4237,29 @@ do
 	-- The polygons this caster just put on `wf` (Out from `from` on) lose whatever earlier ones
 	-- on the same face already cover: `others` (casters that come first) and its own earlier ones.
 	-- `first(c)`: does caster c come before this one? `rec` (still records) is redrawn when they move.
+	local unstackInner
 	local function unstack(wf, from, receiver, first, lod, rec)
+		if Out.nPoly < from then
+			return
+		end
+		local keepN, keepNp = Out.nPoly, Out.np
+		local basePts = keepNp
+		for k = from, keepN do
+			basePts -= Out.sizes[k]
+		end
+		local saved = takeOut(wf, from)
+		Out.nPoly, Out.np = keepN, keepNp -- (takeOut only moved the counts back: put them back)
+		local ok = pcall(unstackInner, wf, from, receiver, first, lod, rec)
+		if not ok then
+			-- (something odd in this geometry: better a shadow drawn twice than none)
+			Out.nPoly, Out.np = from - 1, basePts
+			for _, pc in ipairs(saved) do
+				emitPlain(wf, pc[1], pc[2], pc[3], pc[4])
+			end
+		end
+	end
+
+	unstackInner = function(wf, from, receiver, first, lod, rec)
 		if Out.nPoly < from then
 			return
 		end
@@ -5694,6 +5842,11 @@ do
 		end
 		-- 4. show it
 		local view = info.sil
+		if view and view.gui.Parent == nil then
+			-- the game cleared its PlayerGui (some do on respawn or in menus): make a new one
+			Silhouette.drop(info)
+			view = nil
+		end
 		if not view then
 			view = newView()
 			info.sil = view
@@ -5742,6 +5895,7 @@ do
 		view.canvas.CFrame = CFrame.fromMatrix(center + n * (CONFIG.SurfaceOffset - THICK * 0.5), -v, -u)
 		if holdHidden then
 			Silhouette.hide(info) -- the start-up pause shows everything at once afterwards
+			return nil
 		elseif not view.shown then
 			view.shown = true
 			view.canvas.Parent = holderModel()
@@ -5799,7 +5953,18 @@ do
 		local part = state.part
 		local size = part.Size
 		local t = part.Transparency
+		if not state.character then
+			-- a part a game hides on this screen only (a roof over the player, say) is gone here too
+			local okLtm, ltm = pcall(function()
+				return part.LocalTransparencyModifier
+			end)
+			if okLtm and type(ltm) == "number" and ltm > t then
+				t = t + (1 - t) * ltm
+			end
+		end
+		-- ForceField parts are see-through effects: Roblox gives them no shadow either
 		local visible = t < 0.98 and max(size.X, size.Y, size.Z) >= CONFIG.MinPartSize and not state.ignored
+			and part.Material ~= Enum.Material.ForceField
 		-- glowing (Neon) parts give off their own light: shadows don't darken them
 		local glow = CONFIG.GlowingPartsStayLit and part.Material == Enum.Material.Neon
 		state.glow = glow
@@ -5983,6 +6148,7 @@ do
 				state.inPhys = true
 			end
 			addToChunk(state)
+			NoQuery.update(state)
 			if initialScanDone and state.isReceiver then
 				queueUpstream(state)
 			end
@@ -5990,6 +6156,7 @@ do
 	end
 
 	function unregister(state)
+		NoQuery.remove(state.part)
 		if state.dead then
 			return
 		end
@@ -6040,6 +6207,7 @@ do
 		state.dynamic = true
 		dynamicStates[state] = true
 		removeFromChunk(state)
+		NoQuery.remove(state.part)
 		markDependentsDirty(state)
 	end
 
@@ -6059,6 +6227,7 @@ do
 		end
 		state.lastCF = state.part.CFrame
 		addToChunk(state)
+		NoQuery.update(state)
 		if state.isReceiver then
 			queueUpstream(state)
 		end
@@ -6083,6 +6252,7 @@ do
 		if state.dynamic then
 			return
 		end
+		NoQuery.update(state)
 		if state.isCaster and not state.chunk then
 			addToChunk(state)
 		elseif not state.isCaster and state.chunk then
@@ -6099,7 +6269,8 @@ do
 
 	local MOVE_PROPS = {CFrame = true, Position = true, Orientation = true, Rotation = true}
 	local SHAPE_PROPS = {Size = true, Shape = true, MeshId = true, MeshContent = true}
-	local LOOK_PROPS = {Transparency = true, CastShadow = true, Color = true, Material = true}
+	local LOOK_PROPS = {Transparency = true, CastShadow = true, Color = true, Material = true,
+		LocalTransparencyModifier = true, CanQuery = true}
 
 	onPartChanged = function(state, prop)
 		if state.dead then
@@ -6403,6 +6574,9 @@ do
 	local lastTerrainCheck = -100
 	local lastCharacterRefresh = 0
 	local wholeMapChecked = nil
+	local startClock, lastShadowCheck = nil, nil
+	-- a phone or tablet (touch, no keyboard): less time to spare each frame
+	local touchOnly = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
 	local function lodFor(d, current)
 		local h = (current == nil or current == 0) and 0 or 10
@@ -6486,6 +6660,12 @@ do
 		if not st.isCaster or st.dead or st.dynamic then
 			return false
 		end
+		if st.retryAt then
+			if clock() < st.retryAt then
+				return false
+			end
+			st.retryAt = nil
+		end
 		local rec = st.casterRec
 		if rec and rec.lod ~= ch.lod and rec.lodDep == false then
 			-- (blocks on blocks: the same shadows at any detail - nothing to redo walking around)
@@ -6497,9 +6677,14 @@ do
 	local function buildStatic(st, lod)
 		local built, failed = safeCall(buildStaticCaster, st, lod)
 		if failed then
-			st.dirty = false -- don't retry a broken part every frame
+			-- (something unusual about this part: try again in a moment, not every frame, and give
+			-- up after a few tries so one odd part can't hold up the rest)
+			st.fails = (st.fails or 0) + 1
+			st.retryAt = clock() + 2 * st.fails
+			st.dirty = st.fails < 4
 			return true
 		end
+		st.fails = nil
 		return built
 	end
 
@@ -6775,8 +6960,21 @@ do
 		frameId += 1
 		local now = clock()
 		RaySample.budget = warm and 40 or 3
-		local loading = not initialScanDone or staticHead <= #staticQueue
-		local budget = budgetMs or ((loading and dt < 1 / 40) and CONFIG.LoadingBudget or CONFIG.FrameBudget)
+		-- the bigger loading budget only in the first seconds (walking into new areas used it too,
+		-- which made phones stutter); phones get a lighter budget all along
+		startClock = startClock or now
+		local loading = (not initialScanDone or staticHead <= #staticQueue) and now - startClock < CONFIG.LoadingTime
+		local frameBudget = touchOnly and CONFIG.MobileFrameBudget or CONFIG.FrameBudget
+		local budget = budgetMs or ((loading and dt < 1 / 40) and CONFIG.LoadingBudget or frameBudget)
+		-- Roblox's own shadows stay off (a game script may keep switching them on)
+		if started and enabled and CONFIG.DisableRobloxShadows and now - (lastShadowCheck or 0) > 1 then
+			lastShadowCheck = now
+			if Lighting.GlobalShadows then
+				pcall(function()
+					Lighting.GlobalShadows = false
+				end)
+			end
+		end
 		local deadline = now + budget / 1000
 		local settled = initialScanDone and not warm
 
