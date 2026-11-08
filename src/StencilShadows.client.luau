@@ -21,12 +21,17 @@
 	   small per-frame time budget). Moving parts, vehicles and characters are rebuilt whenever
 	   they move. Shadows also land on players and loose parts, drape over terrain, and the sides
 	   of parts that face away from the light are dark, as if inside the old shadow volumes.
-	   Only parts Roblox would give a shadow cast one (CastShadow on, not see-through or hidden).
+	   Only parts Roblox would give a shadow cast one (CastShadow on, not see-through or hidden),
+	   and only in games that have shadows switched on (FollowGameShadows).
 	 * Characters cast their exact silhouette on flat floors (a black copy seen from the light),
-	   and real avatar outlines elsewhere. Their dark sides come from copies of their meshes
-	   (dynamic heads and hair too); a character fully in shade is darkened by one Highlight.
+	   and real avatar outlines elsewhere. Their dark sides come from copies of their parts: a
+	   block that reaches out of a body block's dark sides, and copies of heads (in the old head's
+	   facet steps), hair and meshes pushed away from the light; a character fully in shade is
+	   darkened by one Highlight.
 	 * Shadows follow the sun, and the moon at night. In the 2013 edition (DynamicLights) lamps
-	   light up shadows where they shine and cast stencil shadows of their own there.
+	   light up shadows where they shine and cast stencil shadows of their own there (lights
+	   with Shadows off just light things up, like in Roblox).
+	 * Something looks wrong? Set ShowDiagnostics = true and screenshot the box it shows.
 
 	 Other scripts can use _G.StencilShadows:  SetEnabled(bool), Toggle(), IsEnabled(),
 	 Rebuild(), GetStats(), Destroy().
@@ -49,7 +54,10 @@ local CONFIG = {
 	                                      --              their edges look jagged on phones)
 	DirectTransparency = 0.62,            -- part transparency used by the "Direct" style
 	SurfaceOffset = 0.04,                 -- how far shadows float off a surface (stops z-fighting)
-	CharacterSurfaceOffset = 0.012,       -- the same on characters (seen up close: kept tight)
+	CharacterSurfaceOffset = 0.035,       -- the same for shadows landing on characters (+ a bit
+	                                      -- more the farther away they are)
+	CharacterShadeOffset = 0.04,          -- how far a body part's dark side reaches out of it
+	LayeredClothingThickness = 0.1,       -- ...out of parts under layered clothing (a jacket)
 	ShadeBackFaces = true,                -- sides facing away from the light are shadowed too
 	RoundShading = "Blocky",              -- dark sides of balls / cylinders: "Blocky" = in steps,
 	                                      -- facet by facet, like the old engine's low-poly balls;
@@ -87,6 +95,8 @@ local CONFIG = {
 	CurveSegments = {24, 16, 10},         -- sides used for round shadows: near / mid / far
 
 	-- What casts and receives -------------------------------------------------------------------
+	FollowGameShadows = true,             -- a game that has its own shadows switched off
+	                                      -- (Lighting.GlobalShadows) gets no sun shadows either
 	RespectCastShadow = true,             -- parts with CastShadow off don't cast stencil shadows
 	MinPartSize = 0.15,                   -- skip parts whose largest side is smaller than this
 	OpaqueThreshold = 0.05,               -- Transparency above this counts as a transparent part
@@ -102,7 +112,9 @@ local CONFIG = {
 	AvatarOutlines = true,                -- real avatar outlines from hidden hull copies of their meshes
 	ExactSilhouettes = true,              -- on flat lit floors, characters cast their exact silhouette
 	MaxSilhouettes = 4,                   -- characters (nearest first) that can have one at a time
-	ShadowsOnAvatars = true,              -- package avatars darken in shadow (real mesh shape)
+	ShadowsOnAvatars = true,              -- avatars get their dark sides and darken in shadow
+	MaxShadeHighlights = 3,               -- characters (nearest first) darkened by one Highlight
+	                                      -- when fully in shade (Roblox draws 31 Highlights at most)
 	IgnoreAttribute = "NoStencilShadow",  -- set this attribute to true on a part / model to skip it
 
 	-- Moving things -----------------------------------------------------------------------------
@@ -124,6 +136,10 @@ local CONFIG = {
 
 	-- Roblox's own shadows ----------------------------------------------------------------------
 	DisableRobloxShadows = true,          -- Lighting.GlobalShadows is off while this is enabled
+
+	-- Troubleshooting ---------------------------------------------------------------------------
+	ShowDiagnostics = false,              -- a small box in the corner says what the script sees
+	                                      -- (your avatar, its floor shadow, errors): screenshot it
 
 	-- Start-up ----------------------------------------------------------------------------------
 	LoadPause = false,                    -- freeze the game at the start until nearby shadows are
@@ -519,6 +535,11 @@ local Light = {
 
 do
 	local function readLightDirection()
+		-- the game has its own shadows switched off: it gets no sun shadows from us either
+		Light.gameOff = CONFIG.FollowGameShadows and not savedGlobalShadows
+		if Light.gameOff then
+			return nil
+		end
 		local minY = sin(rad(CONFIG.MinLightElevation))
 		local dir = Lighting:GetSunDirection()
 		if dir.Y < minY then
@@ -1867,7 +1888,15 @@ do
 		if #pts < 4 then
 			return nil
 		end
-		return supportPoints(pts, true)
+		-- a plain box? (every point it hit lies on the box's surface: no rounded edges or corners)
+		local boxy = true
+		for _, p in ipairs(pts) do
+			if max(abs(p.X), abs(p.Y), abs(p.Z)) < 0.47 then
+				boxy = false
+				break
+			end
+		end
+		return supportPoints(pts, true), boxy
 	end
 
 	local function probe(entry)
@@ -1888,7 +1917,7 @@ do
 			part.CFrame = SPOT
 			entry.size = part.Size
 			part.Parent = probeModel()
-			entry.pts = sampleCopy(part)
+			entry.pts, entry.boxy = sampleCopy(part)
 		end)
 		pcall(part.Destroy, part)
 		if not ok then
@@ -2002,16 +2031,19 @@ do
 	-- BodyShade), so nothing ever sticks out of the avatar.
 	local function avatarMeshShape(state, part, size, lod)
 		local name = part.Name
-		local info = state.charInfo
-		local field = DESC_FIELD[name]
+		local bodyPart = DESC_FIELD[name] ~= nil and not state.accessory
 		state.polyReceive = nil
-		if field and info and info.blocky and info.blocky[field] then
-			state.shadeKind = nil -- exact faces take shadows the normal way
-			return Shapes.box(size) -- the default blocky body: these parts really are boxes
+		local content = part.MeshContent
+		local uri = content and content.Uri
+		if bodyPart and (uri == nil or uri == "") then
+			-- the default blocky R15 body: its parts come with no mesh at all and really are
+			-- boxes (its dark sides from block copies, shadows on it drawn exactly)
+			state.shadeKind = "box"
+			state.polyReceive = true
+			return Shapes.box(size)
 		end
 		-- body parts, hair and hats: dark sides and shade from copies of their real mesh
 		state.shadeKind = "mesh"
-		local content = part.MeshContent
 		-- 1. the real mesh, when the game lets meshes be read
 		local entry = MeshData.allowed and MeshData.get(content) or nil
 		if entry then
@@ -2023,6 +2055,12 @@ do
 		-- 2. a hidden copy of the mesh with an exact hull collision shape, raycast once per mesh
 		local probe = MeshProbe.get(content, state)
 		if probe and probe.status == "ready" then
+			if bodyPart and probe.boxy then
+				-- a body part whose mesh is a plain box after all (blocky bodies)
+				state.shadeKind = "box"
+				state.polyReceive = true
+				return Shapes.box(size)
+			end
 			return Shapes.fromPoints("h" .. probe.key, probe.pts, size, ZERO, false)
 		end
 		-- 3. the avatar's own collision shape, unless that's just a box (it usually is)
@@ -2049,12 +2087,14 @@ do
 		state.charMesh = nil
 		state.shadeKind = nil
 		state.polyReceive = nil
+		state.classicHead = nil
 		if name == "Head" then
 			local mesh = part:FindFirstChildWhichIsA("DataModelMesh")
 			if mesh and mesh:IsA("SpecialMesh") and mesh.MeshType == Enum.MeshType.Head then
-				-- shadows land on it as polygons; its dark side is its facets (blocky), or a copy of
-				-- it (see BodyShade)
-				state.shadeKind = (CONFIG.RoundShading ~= "Blocky") and "part" or nil
+				-- shadows land on it as polygons; its dark side comes from a copy of it whose dark
+				-- half steps round facet by facet like the old 16-sided head (see BodyShade)
+				state.shadeKind = "part"
+				state.classicHead = true
 				state.polyReceive = true
 				local scale = mesh.Scale
 				return Shapes.classicHead(size.Y * scale.Y, min(size.X, size.Y, size.Z) * scale.X, lod, mesh.Offset)
@@ -2168,7 +2208,12 @@ do
 		local size = part.Size
 		if part:IsA("MeshPart") then
 			return meshPartShape(state, part, size, lod)
-		elseif part:IsA("PartOperation") then
+		end
+		if state.character then
+			-- (everything on a character gets its dark side from a copy: see BodyShade)
+			state.shadeKind, state.polyReceive, state.classicHead = "part", nil, nil
+		end
+		if part:IsA("PartOperation") then
 			return unionShape(state, part, size)
 		end
 		local className = part.ClassName
@@ -2177,13 +2222,20 @@ do
 		elseif className == "CornerWedgePart" then
 			return Shapes.cornerWedge(size)
 		elseif part:IsA("Part") then
+			local mesh = part:FindFirstChildWhichIsA("DataModelMesh")
 			if state.character then
 				local s = avatarPartShape(state, part, size, lod)
 				if s then
 					return s
 				end
+				if not mesh and part.Shape == Enum.PartType.Block then
+					-- a plain block (an R6 limb or torso): a block copy darkens its dark sides
+					state.shadeKind = "box"
+					state.polyReceive = true
+					return Shapes.box(size)
+				end
+				state.shadeKind = "part"
 			end
-			local mesh = part:FindFirstChildWhichIsA("DataModelMesh")
 			if mesh then
 				return specialMeshShape(state, mesh, size, lod)
 			end
@@ -2447,8 +2499,11 @@ do
 		local list = state.wf or {}
 		local faces = shape.faces
 		local cf = state.part.CFrame
-		-- characters are seen up close: their shadows sit tighter on them
-		local lift = state.character and CONFIG.CharacterSurfaceOffset or CONFIG.SurfaceOffset
+		-- characters are seen up close: shadows sit tighter on them (but far enough off to stay
+		-- visible on phones and while the avatar animates)
+		local info = state.character and state.charInfo
+		local lift = state.character and (CONFIG.CharacterSurfaceOffset + (info and info.dist or 0) * 0.001)
+			or CONFIG.SurfaceOffset
 		local dl = shape.blocky and cf:VectorToObjectSpace(Light.dir)
 		for i = 1, #faces do
 			local lf = faces[i]
@@ -2470,7 +2525,10 @@ end
 ----------------------------------------------------------------------------------------------------
 -- Output: the shadow polygons produced by one job (world space)
 ----------------------------------------------------------------------------------------------------
-local Lamps = {active = false, rec = nil, version = 0}
+-- (lightShadows: lights whose own Roblox shadows were on before this script switched them off;
+-- watched: lights whose Shadows property is being watched)
+local Lamps = {active = false, rec = nil, version = 0, lightShadows = setmetatable({}, {__mode = "k"}),
+	watched = setmetatable({}, {__mode = "k"})}
 -- Still parts with CanQuery off (spatial queries skip them), on a coarse grid of their own.
 local NoQuery = {count = 0, cells = {}, where = {}}
 do
@@ -4501,8 +4559,9 @@ do
 							minY, maxY = min(minY, g.minY), max(maxY, g.maxY)
 							minZ, maxZ = min(minZ, g.minZ), max(maxZ, g.maxZ)
 						end
+						-- (a character's dark sides come from copies of its parts: see BodyShade)
 						if CONFIG.ShadeBackFaces and shape.shade and not st.tint and not st.glow and fade == 0
-							and not owner.fullShade then
+							and not owner.fullShade and not st.character then
 							emitBackFaces(st, shape)
 						end
 					end
@@ -4637,6 +4696,7 @@ do
 		local ok, res = pcall(fn, ...)
 		if not ok then
 			errorCount += 1
+			stats.lastError = tostring(res)
 			if errorCount <= 10 then
 				warn("[StencilShadows] " .. tostring(res))
 			end
@@ -4710,6 +4770,8 @@ do
 			end
 			local spread = kind == "point" and 180 or math.clamp(light.Angle, 1, 180)
 			return {
+				-- a light with Shadows off lights things up without casting shadows (like in Roblox)
+				shadows = Lamps.lightShadows[light] == true or light.Shadows == true,
 				kind = kind, pos = cf.Position, dir = dir, corners = corners, part = part,
 				cosHalf = math.cos(math.rad(spread) * 0.5), range = light.Range, bright = light.Brightness,
 				moving = part ~= nil and part:IsA("BasePart") and not part.Anchored,
@@ -4753,8 +4815,8 @@ do
 				local sig = ""
 				if info then
 					local p = info.pos
-					sig = string.format("%s%.1f,%.1f,%.1f|%.1f|%.2f|%.3f", info.kind, p.X, p.Y, p.Z, info.range,
-						info.bright, info.cosHalf)
+					sig = string.format("%s%.1f,%.1f,%.1f|%.1f|%.2f|%.3f|%s", info.kind, p.X, p.Y, p.Z, info.range,
+						info.bright, info.cosHalf, info.shadows and "s" or "n")
 					if info.dir then
 						sig ..= string.format("|%.2f,%.2f,%.2f", info.dir.X, info.dir.Y, info.dir.Z)
 					end
@@ -4880,6 +4942,7 @@ do
 	end
 
 	-- The still things a lamp can cast a shadow of (checked again when the lamp changes).
+	local NO_CASTERS = {}
 	local function castersOf(lamp)
 		local list = lamp.casters
 		if list then
@@ -5107,10 +5170,10 @@ do
 				if inner >= 3 then
 					ccw(IX, IY, inner)
 				end
-				-- the lamp's own shadows here
+				-- the lamp's own shadows here (if its light casts any)
 				local h = (lamp.pos - o):Dot(nrm)
 				local shadows = {}
-				for _, st in ipairs(castersOf(lamp)) do
+				for _, st in ipairs(lamp.shadows and castersOf(lamp) or NO_CASTERS) do
 					local k = lampShadow(lamp, st, o, nrm, u, v, h, QSX, QSY)
 					if k >= 3 then
 						local sp = copyPoly(QSX, QSY, k)
@@ -5203,8 +5266,10 @@ do
 	local shadeParams = RaycastParams.new()
 	shadeParams.FilterType = Enum.RaycastFilterType.Exclude
 	shadeParams.IgnoreWater = true
-	local GROW = 0.02      -- studs the copy is bigger than the part on each side
-	local PER_FRAME = 6    -- parts per character re-checked against the sun each frame
+	local PER_FRAME = 6    -- parts of your character re-checked against the sun each frame
+	local PER_FRAME_OTHER = 2 -- ...of anyone else's
+	local SLAB_IN = 0.01   -- a block copy's sides toward the light stay this far inside the block
+	local SNAP = 2 * pi / 16
 
 	-- Does anything that casts a shadow sit between this point and the light?
 	local function blocked(origin, len)
@@ -5298,17 +5363,69 @@ do
 			return part:IsA("MeshPart") and part.HasSkinnedMesh
 		end)
 		st.copySkinned = bones ~= nil or (okSkin and skinned == true)
+		st.copyMesh, st.copyScale = nil, nil
 		if st.shadeKind == "charmesh" then
 			-- an R6 limb dressed in a package mesh: the copy shows that mesh too
 			local mesh = Instance.new("SpecialMesh")
 			mesh.MeshType = Enum.MeshType.FileMesh
 			mesh.MeshId = "rbxassetid://" .. tostring(st.charMesh)
 			mesh.Parent = copy
-			st.copyMesh = mesh
+			st.copyMesh, st.copyScale = mesh, Vector3.one
+		else
+			-- a hat or hair made of a part and a mesh: that mesh keeps its own size when the part
+			-- grows, so it's scaled up itself to darken all of it
+			local mesh = copy:FindFirstChildOfClass("SpecialMesh")
+			if mesh and mesh.MeshType == Enum.MeshType.FileMesh then
+				st.copyMesh, st.copyScale = mesh, mesh.Scale
+			end
 		end
 		copy.Name = "BodyShade"
 		Render.styleShade(copy)
 		return copy
+	end
+
+	-- A plain block's copy is a block of its own, sized afresh every frame (see boxCopy).
+	local function makeBoxCopy()
+		local p = Instance.new("Part")
+		p.Name = "BodyShade"
+		Render.styleShade(p)
+		return p
+	end
+
+	local function boxSpan(h, d, g)
+		local hi = d < MIN_LIT and h + g or h - SLAB_IN
+		local lo = -d < MIN_LIT and -h - g or -h + SLAB_IN
+		return lo, hi
+	end
+
+	-- A block's dark side: a block that reaches g out of every side of it facing away from the
+	-- light (by the same rule as the old shadow volumes: facing away = dark) and stays just inside
+	-- the sides facing the light. Every dark side is darkened evenly, however steeply the light
+	-- falls on it. whole: out of every side (the block is in a shadow).
+	local function boxCopy(cf, size, whole, g)
+		local hx, hy, hz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
+		if whole then
+			return cf, V3(size.X + 2 * g, size.Y + 2 * g, size.Z + 2 * g)
+		end
+		local dl = cf:VectorToObjectSpace(Light.dir)
+		local x0, x1 = boxSpan(hx, dl.X, g)
+		local y0, y1 = boxSpan(hy, dl.Y, g)
+		local z0, z1 = boxSpan(hz, dl.Z, g)
+		return cf * CFrame.new((x0 + x1) * 0.5, (y0 + y1) * 0.5, (z0 + z1) * 0.5),
+			V3(max(x1 - x0, 0.01), max(y1 - y0, 0.01), max(z1 - z0, 0.01))
+	end
+
+	-- The classic head: the old head mesh had 16 flat sides (one facing straight ahead), and its
+	-- dark side always ended on an edge between two of them. The light is turned to the nearest
+	-- such edge, so the copy's dark side steps round facet by facet like the old one did.
+	local function headLightDir(cf)
+		local dl = cf:VectorToObjectSpace(Light.dir)
+		local h = sqrt(dl.X * dl.X + dl.Z * dl.Z)
+		if h < 1e-4 then
+			return Light.dir
+		end
+		local phi = (floor(atan2(dl.X, -dl.Z) / SNAP) + 0.5) * SNAP
+		return cf:VectorToWorldSpace(V3(sin(phi) * h, dl.Y, -cos(phi) * h))
 	end
 
 	-- A skinned copy finds its bones by name in its own model, so each character's skinned copies
@@ -5363,10 +5480,14 @@ do
 		return not st.dead and st.isReceiver and (st.ltmLevel or 0) == 0
 	end
 
-	-- A part either sits in a shadow (its copy, a hair bigger, darkens all of it), or it's lit and
-	-- only its side away from the light is dark: its copy is pushed a hair away from the light, so
-	-- the copy only pokes out of the real part on that side, and the Highlight darkens exactly the
-	-- real surface there - the same thing the old shadow volumes did.
+	-- Every visible part of an avatar gets its dark side from a copy of itself (cheap: one part
+	-- each, it just follows the part). A part is either in a shadow (its copy, a little bigger,
+	-- darkens all of it) or lit, and then only its side away from the light is dark:
+	--   * a plain block (R6 limbs, the default blocky R15 body): a block that reaches out of the
+	--     sides facing away from the light only (see boxCopy);
+	--   * anything round or meshed (heads, hair, hats, package bodies): a copy pushed away from the
+	--     light, so it only pokes out of the real part on that side - what the old shadow volumes
+	--     did. (Drawn far enough off the surface to stay visible on phones and while animating.)
 	function BodyShade.update(info)
 		local main = Render.layers.main.model
 		local filter = {info.model, main, Render.layers.tint.model, Workspace.Terrain}
@@ -5382,9 +5503,12 @@ do
 		if n == 0 then
 			return
 		end
+		-- polygons draw the shadows landing on its blocks and head (when it's near enough for
+		-- that); otherwise a part in a shadow is darkened whole by its copy
+		local polyRecv = info.polyRecv == true
 		-- re-check a few parts against the sun each frame (round robin)
 		local cursor = info.shadeCursor or 0
-		for _ = 1, min(n, PER_FRAME) do
+		for _ = 1, min(n, info.isLocal and PER_FRAME or PER_FRAME_OTHER) do
 			cursor = cursor % n + 1
 			local st = members[cursor]
 			if visibleMember(st) and Light.valid then
@@ -5394,13 +5518,13 @@ do
 			else
 				st.inShade = nil
 			end
-			st.shaded = st.shadeKind ~= nil and not st.polyReceive and st.inShade == true
 		end
 		info.shadeCursor = cursor
 		-- the whole character in shade? (once on, it waits for two lit parts or a lasting one)
 		local lit, known = 0, 0
 		for i = 1, n do
 			local st = members[i]
+			st.shaded = st.shadeKind ~= nil and st.inShade == true and not (st.polyReceive and polyRecv)
 			if st.inShade ~= nil and visibleMember(st) then
 				known += 1
 				if not st.inShade then
@@ -5422,11 +5546,14 @@ do
 		else
 			full = known > 0 and lit == 0 and Light.valid and not holdHidden
 		end
+		-- (only the nearest few get the Highlight: Roblox draws 31 at most, the game's own included;
+		-- the rest are darkened part by part)
+		full = full and info.highlightOk == true
 		if full ~= (info.fullShade or false) then
 			info.fullShade = full
 			info.litSince = nil
 			setFullShade(info, full)
-			-- drawn polygons (dark sides, shadows on the head) give way to it, or come back
+			-- drawn polygons (shadows on the blocks and head) give way to it, or come back
 			if info.casterRec then
 				info.casterRec.lightVersion = -1
 			end
@@ -5434,16 +5561,18 @@ do
 				info.recvRec.lightVersion = -1
 			end
 		end
-		local push = 0.02 + (info.dist or 0) * 0.0005
-		local away = Light.dir * -push
+		local dist = info.dist or 0
+		local reach = CONFIG.CharacterShadeOffset + dist * 0.001
+		local clothReach = max(reach, CONFIG.LayeredClothingThickness + dist * 0.001)
 		local camera = Workspace.CurrentCamera
 		local camPos = camera and camera.CFrame.Position
 		-- every frame: the copies follow their parts
 		for i = 1, n do
 			local st = members[i]
 			local copy = st.shadeCopy
+			local kind = st.shadeKind
 			local mode = nil
-			if not full and st.shadeKind and visibleMember(st) and Light.valid then
+			if not full and kind and visibleMember(st) and Light.valid then
 				if st.shaded then
 					mode = "whole"
 				elseif CONFIG.ShadeBackFaces and not st.lampLit then
@@ -5451,38 +5580,59 @@ do
 				end
 			end
 			if mode then
+				if copy ~= nil and st.copyKind ~= kind then
+					-- (its shape turned out different: a box after all, or a mesh)
+					if copy then
+						pcall(copy.Destroy, copy)
+					end
+					copy = nil
+				end
 				if copy == nil then
-					copy = makeCopy(st) or false
-					st.shadeCopy = copy
+					if kind == "box" then
+						copy = makeBoxCopy()
+					else
+						copy = makeCopy(st) or false
+					end
+					st.shadeCopy, st.copyKind = copy, kind
 				end
 				if copy then
 					local part = st.part
-					local size, cf, scale = part.Size, part.CFrame, 1
-					if mode == "whole" then
+					local size, cf = part.Size, part.CFrame
+					-- (under layered clothing it has to reach out past the clothing)
+					local g = st.covered and clothReach or reach
+					local scale = 1
+					if kind == "box" then
+						cf, size = boxCopy(cf, size, mode == "whole", g)
+					elseif mode == "whole" then
 						if st.copySkinned then
-							-- a skinned mesh can't simply be made bigger: it moves a hair toward
-							-- the camera instead, so it covers the real one
+							-- a skinned mesh can't simply be made bigger: it moves toward the camera
+							-- instead, so it covers the real one
 							if camPos then
 								local toCam = camPos - cf.Position
 								local d = toCam.Magnitude
 								if d > 1e-3 then
-									cf += toCam * ((0.02 + d * 0.0005) / d)
+									cf += toCam * (g / d)
 								end
 							end
 						else
-							size += V3(GROW * 2, GROW * 2, GROW * 2)
-							scale = 1.03
+							local small = max(min(size.X, size.Y, size.Z), 0.2)
+							scale = 1 + 2 * g / small
+							size += V3(g * 2, g * 2, g * 2)
 						end
 					else
-						cf += away
+						local toLight = st.classicHead and headLightDir(cf) or Light.dir
+						cf += toLight * -g
 					end
 					if copy.Size ~= size then
 						copy.Size = size
 					end
 					copy.CFrame = cf
 					local mesh = st.copyMesh
-					if mesh and mesh.Scale.X ~= scale then
-						mesh.Scale = V3(scale, scale, scale)
+					if mesh then
+						local want = st.copyScale * scale
+						if mesh.Scale ~= want then
+							mesh.Scale = want
+						end
 					end
 					local bones = st.copyBones
 					if bones then
@@ -5531,7 +5681,7 @@ do
 
 	function BodyShade.drop(st)
 		local copy = st.shadeCopy
-		st.shadeCopy = nil
+		st.shadeCopy, st.copyKind = nil, nil
 		st.copyBones = nil
 		st.shaded = false
 		if copy then
@@ -5727,6 +5877,7 @@ do
 	-- Shows the silhouette when it fits. Returns the floor part it's drawn on, or nil.
 	function Silhouette.update(info, root)
 		if not CONFIG.ExactSilhouettes or not Light.valid or root == nil then
+			info.silWhy = "off"
 			Silhouette.hide(info)
 			return nil
 		end
@@ -5738,6 +5889,7 @@ do
 		local floorPart = hit and hit.Instance
 		local fst = floorPart and states[floorPart]
 		if not fst or fst.dynamic or not fst.isReceiver then
+			info.silWhy = floorPart and ("floor " .. floorPart.Name .. " can't take it") or "no floor below"
 			Silhouette.hide(info)
 			return nil
 		end
@@ -5745,6 +5897,7 @@ do
 		local L = Light.L
 		local sinE = -L:Dot(n) -- how high the light stands above this floor
 		if sinE < 0.15 then
+			info.silWhy = "sun too low"
 			Silhouette.hide(info)
 			return nil
 		end
@@ -5780,6 +5933,7 @@ do
 			spots[i] = nil
 		end
 		if ns == 0 then
+			info.silWhy = "nothing casts"
 			Silhouette.hide(info)
 			return nil
 		end
@@ -5810,12 +5964,14 @@ do
 			info.silSupport = sup
 		end
 		if not sup.ok then
+			info.silWhy = "floor not flat all round (edge, step or gap)"
 			Silhouette.hide(info)
 			return nil
 		end
 		-- (2013 edition: where a lamp lights the floor, the shadow is taken away there - the
 		-- polygons can show that, the silhouette can't)
 		if Lamps.active and Lamps.lights(center + n * 0.1, info.model) then
+			info.silWhy = "a lamp lights the floor"
 			Silhouette.hide(info)
 			return nil
 		end
@@ -5837,6 +5993,7 @@ do
 		end
 		local share = nl / ns
 		if share < (info.sil and info.sil.shown and 0.6 or 0.8) then
+			info.silWhy = "in another shadow"
 			Silhouette.hide(info)
 			return nil
 		end
@@ -5886,8 +6043,9 @@ do
 		local up = u * sinE + n * cosE
 		view.cam.CFrame = CFrame.fromMatrix(center - L * dist, v, -up)
 		view.cam.FieldOfView = math.deg(2 * math.atan(W * 0.5 / dist))
-		-- the canvas: its front face lies on the floor; across it runs v, along it runs u
-		local px = math.clamp(math.floor(W * 40 + 0.5), 96, 512)
+		-- the canvas: its front face lies on the floor; across it runs v, along it runs u. Sharp
+		-- enough across and along the shadow (a low sun stretches it out: more pixels then)
+		local px = math.clamp(math.floor(max(W * 56, Lu * 40) + 0.5), 128, 900)
 		if view.gui.CanvasSize.X ~= px then
 			view.gui.CanvasSize = Vector2.new(px, px)
 		end
@@ -5901,6 +6059,7 @@ do
 			view.canvas.Parent = holderModel()
 			view.gui.Enabled = true
 		end
+		info.silWhy = "shown"
 		-- the polygons leave this floor plane to the silhouette
 		local plane = info.silPlaneT or {}
 		info.silPlaneT = plane
@@ -5974,6 +6133,12 @@ do
 			caster = false
 		end
 		if caster and state.accessory and not CONFIG.AccessoryShadows then
+			caster = false
+		end
+		-- layered clothing (a 3D jacket, pants, shoes) only takes its shape on the body: its own
+		-- mesh would cast a shapeless blob, so the body under it casts the shadow instead
+		state.layered = state.accessory == true and part:FindFirstChildOfClass("WrapLayer") ~= nil
+		if caster and state.layered then
 			caster = false
 		end
 		state.tint = false
@@ -6507,49 +6672,60 @@ do
 		physCursor = i
 	end
 
-	local BODY_FIELDS = {"Torso", "LeftArm", "RightArm", "LeftLeg", "RightLeg"}
+	-- Body parts a layered-clothing accessory covers, by its AccessoryType: their dark side has to
+	-- reach out past the clothing. (Sleeves are taken to stop at the elbow, legs to go all the way.)
+	local TOP = {"UpperTorso", "LowerTorso", "Torso", "LeftUpperArm", "RightUpperArm"}
+	local LEGS = {"LowerTorso", "LeftUpperLeg", "RightUpperLeg", "LeftLowerLeg", "RightLowerLeg", "Left Leg", "Right Leg"}
+	local COVERS = {
+		TShirt = TOP, Shirt = TOP, Jacket = TOP, Sweater = TOP,
+		Pants = LEGS, DressSkirt = LEGS, Shorts = {"LowerTorso", "LeftUpperLeg", "RightUpperLeg"},
+		LeftShoe = {"LeftFoot"}, RightShoe = {"RightFoot"},
+	}
 
-	-- What the avatar is wearing: R6 package meshes (CharacterMesh) and, from the
-	-- HumanoidDescription, which R15 body parts are the default blocky ones (asset id 0).
+	-- What the avatar is wearing: R6 package meshes (CharacterMesh), and the body parts under
+	-- layered clothing. (Not the HumanoidDescription: its body part ids aren't sent to players'
+	-- computers, so there they always read 0.)
 	local function readBody(model)
-		local meshes, blocky, sig = nil, nil, ""
+		local meshes, covered, sig = nil, nil, ""
 		for _, child in ipairs(model:GetChildren()) do
 			if child:IsA("CharacterMesh") then
 				meshes = meshes or {}
 				local name = child.BodyPart.Name
 				meshes[name] = child.MeshId
 				sig = sig .. name .. tostring(child.MeshId) .. ","
-			end
-		end
-		local hum = model:FindFirstChildOfClass("Humanoid")
-		local desc = hum and hum:FindFirstChildOfClass("HumanoidDescription")
-		if desc then
-			blocky = {}
-			sig = sig .. "|"
-			for _, field in ipairs(BODY_FIELDS) do
-				local ok, id = pcall(function()
-					return desc[field]
-				end)
-				if ok and id == 0 then
-					blocky[field] = true
-					sig = sig .. field .. ","
+			elseif child:IsA("Accessory") then
+				local handle = child:FindFirstChild("Handle")
+				if handle and handle:FindFirstChildOfClass("WrapLayer") then
+					local ok, kind = pcall(function()
+						return child.AccessoryType.Name
+					end)
+					kind = ok and kind or "Unknown"
+					sig = sig .. "w" .. kind .. ","
+					local list = COVERS[kind]
+					if list then
+						covered = covered or {}
+						for _, name in ipairs(list) do
+							covered[name] = true
+						end
+					end
 				end
 			end
 		end
-		return meshes, blocky, sig
+		return meshes, covered, sig
 	end
 
 	function refreshCharacters()
 		for model, info in pairs(characters) do
 			info.isLocal = LocalPlayer ~= nil and LocalPlayer.Character == model
-			local meshes, blocky, sig = readBody(model)
+			local meshes, covered, sig = readBody(model)
 			local bodyChanged = sig ~= info.bodySig
 			if bodyChanged then
-				info.bodySig, info.charMeshes, info.blocky = sig, meshes, blocky
+				info.bodySig, info.charMeshes, info.covered = sig, meshes, covered
 				info.dirty = true
 			end
 			for _, st in ipairs(info.members) do
 				local part = st.part
+				st.covered = covered ~= nil and covered[part.Name] == true
 				local size, t = part.Size, part.Transparency
 				if bodyChanged or size ~= st.lastSize or t ~= st.lastT then
 					st.lastSize, st.lastT = size, t
@@ -6560,6 +6736,161 @@ do
 					info.dirty = true
 				end
 			end
+		end
+	end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Diagnostics (ShowDiagnostics): a small box in the corner saying what the script sees - your
+-- avatar, how its dark sides and floor shadow are drawn, errors - to screenshot when something
+-- looks wrong.
+----------------------------------------------------------------------------------------------------
+local Diagnostics = {gui = nil, label = nil, last = 0, lastCount = -100, highlights = 0}
+do
+	local function countHighlights()
+		local n = 0
+		local roots = {Workspace}
+		local pg = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		if pg then
+			roots[2] = pg
+		end
+		for _, root in ipairs(roots) do
+			for _, d in ipairs(root:GetDescendants()) do
+				if d:IsA("Highlight") then
+					n += 1
+				end
+			end
+		end
+		return n
+	end
+
+	local function makeLabel()
+		local pg = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		if not pg then
+			return nil
+		end
+		local gui = Instance.new("ScreenGui")
+		gui.Name = "StencilShadowsDiagnostics"
+		gui.ResetOnSpawn = false
+		gui.DisplayOrder = 1000
+		local label = Instance.new("TextLabel")
+		label.Name = "Info"
+		label.Size = UDim2.fromOffset(360, 170)
+		label.Position = UDim2.fromOffset(8, 64)
+		label.BackgroundColor3 = Color3.new(0, 0, 0)
+		label.BackgroundTransparency = 0.35
+		label.BorderSizePixel = 0
+		label.TextColor3 = Color3.new(1, 1, 1)
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.TextYAlignment = Enum.TextYAlignment.Top
+		label.Font = Enum.Font.Code
+		label.TextSize = 11
+		label.TextWrapped = true
+		label.Text = ""
+		label.Parent = gui
+		gui.Parent = pg
+		Diagnostics.gui, Diagnostics.label = gui, label
+		return label
+	end
+
+	local function avatarLines(lines, info)
+		local blocks, meshes, covered, copies, layered = 0, 0, 0, 0, 0
+		local head = "none found"
+		for _, st in ipairs(info.members) do
+			if not st.dead then
+				if st.shadeKind == "box" then
+					blocks += 1
+				elseif st.shadeKind then
+					meshes += 1
+				end
+				if st.covered then
+					covered += 1
+				end
+				if st.layered then
+					layered += 1
+				end
+				local copy = st.shadeCopy
+				if copy and copy.Parent then
+					copies += 1
+				end
+				if st.part.Name == "Head" and not st.accessory then
+					head = st.classicHead and "classic (dark side in facet steps)"
+						or (st.shadeKind == "mesh" and "mesh (copy)" or tostring(st.shadeKind))
+				end
+			end
+		end
+		lines[#lines + 1] = string.format("you: %d parts - %d blocks, %d round/mesh; layered clothing: %d",
+			#info.members, blocks, meshes, layered)
+		lines[#lines + 1] = "head: " .. head
+		lines[#lines + 1] = string.format("dark sides: %d copies shown%s%s", copies,
+			covered > 0 and string.format(" (%d under clothing)", covered) or "",
+			info.fullShade and " - fully in shade" or "")
+		local why = CONFIG.ExactSilhouettes and info.silWhy or "switched off"
+		lines[#lines + 1] = "floor shadow: " .. (why == "shown" and "exact silhouette"
+			or ("outline polygons (silhouette: " .. tostring(why or "not checked yet") .. ")"))
+	end
+
+	function Diagnostics.update(now)
+		if not CONFIG.ShowDiagnostics or now - Diagnostics.last < 0.5 then
+			return
+		end
+		Diagnostics.last = now
+		local label = Diagnostics.label
+		if label == nil or label.Parent == nil or label.Parent.Parent == nil then
+			label = makeLabel()
+			if not label then
+				return
+			end
+		end
+		if now - Diagnostics.lastCount > 5 then
+			Diagnostics.lastCount = now
+			local ok, n = pcall(countHighlights)
+			Diagnostics.highlights = ok and n or -1
+		end
+		local lines = {}
+		lines[1] = string.format("Stencil shadows | %s style | drawn with %s%s", CONFIG.RenderStyle,
+			Render.meshOk and "EditableMesh" or "parts", CONFIG.DynamicLights and " | lamps on" or "")
+		if Light.gameOff then
+			lines[2] = "sun: off - this game has its shadows switched off (FollowGameShadows)"
+		elseif not Light.valid then
+			lines[2] = "sun: below the horizon - no shadows"
+		else
+			local d = Light.dir
+			lines[2] = string.format("sun: on, toward (%.2f, %.2f, %.2f)", d.X, d.Y, d.Z)
+		end
+		local char = LocalPlayer and LocalPlayer.Character
+		local info = char and characters[char]
+		if info then
+			avatarLines(lines, info)
+		else
+			lines[#lines + 1] = "you: no character found"
+		end
+		lines[#lines + 1] = string.format("shadow parts: %d | Highlights in the game: %d (Roblox draws 31)",
+			stats.wedges, Diagnostics.highlights)
+		lines[#lines + 1] = string.format("errors: %d%s", errorCount,
+			stats.lastError and (" - last: " .. string.sub(stats.lastError, 1, 120)) or "")
+		label.Text = table.concat(lines, "\n")
+	end
+
+	-- A short on-screen notice (once), for things the player should know about.
+	local told = {}
+	function Diagnostics.notifyOnce(key, text)
+		if told[key] then
+			return
+		end
+		told[key] = true
+		warn("[StencilShadows] " .. text)
+		pcall(function()
+			game:GetService("StarterGui"):SetCore("SendNotification", {
+				Title = "Stencil shadows", Text = text, Duration = 8,
+			})
+		end)
+	end
+
+	function Diagnostics.destroy()
+		if Diagnostics.gui then
+			pcall(Diagnostics.gui.Destroy, Diagnostics.gui)
+			Diagnostics.gui, Diagnostics.label = nil, nil
 		end
 	end
 end
@@ -6826,7 +7157,7 @@ do
 		if nc > 1 then
 			tsort(CHAR_LIST, distLess)
 		end
-		local casting, receiving, silhouettes = 0, 0, 0
+		local casting, receiving, silhouettes, shading = 0, 0, 0, 0
 		for i = 1, nc do
 			local info = CHAR_LIST[i]
 			local lod = info.dist < CONFIG.NearDetail and 1 or 2
@@ -6857,7 +7188,8 @@ do
 				dropRecord(info.casterRec)
 				info.casterRec = nil
 			end
-			if receiving < CONFIG.MaxCharacterReceivers and info.dist <= CONFIG.ReceiverDistance then
+			local recvOk = receiving < CONFIG.MaxCharacterReceivers and info.dist <= CONFIG.ReceiverDistance
+			if recvOk then
 				receiving += 1
 				local rec = info.recvRec
 				if inBudget and (moved or not rec or rec.lightVersion ~= Light.version or now - (rec.builtAt or 0) > 0.2) then
@@ -6866,15 +7198,19 @@ do
 						info.recvRec.builtAt = now
 					end
 				end
-				-- package avatars: their real shape darkens where they stand in shadow
-				if CONFIG.ShadowsOnAvatars then
-					safeCall(BodyShade.update, info)
-				end
+			elseif info.recvRec then
+				dropRecord(info.recvRec)
+				info.recvRec = nil
+			end
+			info.polyRecv = recvOk
+			-- its dark sides, and darkening where it stands in shadow: copies of its parts (cheap,
+			-- so every character that casts a shadow gets them)
+			if CONFIG.ShadowsOnAvatars and CONFIG.CharacterShadows and shading < CONFIG.MaxCharacters
+				and info.dist <= CONFIG.DynamicDistance then
+				shading += 1
+				info.highlightOk = shading <= CONFIG.MaxShadeHighlights
+				safeCall(BodyShade.update, info)
 			else
-				if info.recvRec then
-					dropRecord(info.recvRec)
-					info.recvRec = nil
-				end
 				BodyShade.clear(info)
 			end
 		end
@@ -6970,10 +7306,20 @@ do
 		if started and enabled and CONFIG.DisableRobloxShadows and now - (lastShadowCheck or 0) > 1 then
 			lastShadowCheck = now
 			if Lighting.GlobalShadows then
+				-- (the game wants shadows after all: so do we)
+				savedGlobalShadows = true
 				pcall(function()
+					Lighting:SetAttribute(SAVED_SHADOWS_ATTR, true)
 					Lighting.GlobalShadows = false
 				end)
 			end
+		end
+		if Light.gameOff then
+			Diagnostics.notifyOnce("gameoff", "This game has its shadows switched off, so no sun shadows are drawn "
+				.. "(set FollowGameShadows = false in the script to draw them anyway).")
+		end
+		if CONFIG.ShowDiagnostics then
+			safeCall(Diagnostics.update, now)
 		end
 		local deadline = now + budget / 1000
 		local settled = initialScanDone and not warm
@@ -7055,19 +7401,17 @@ end
 -- Toggle, Roblox shadows, API, start-up
 ----------------------------------------------------------------------------------------------------
 -- Lamps' own Roblox shadows (Shadows = true): they'd lie on top of the stencil shadows too.
-local lightShadows = setmetatable({}, {__mode = "k"})  -- Light -> its Shadows value before
 local robloxShadowsOff = false
 
-local watchedLights = setmetatable({}, {__mode = "k"})
 
 local function quietLight(light)
-	if not watchedLights[light] then
+	if not Lamps.watched[light] then
 		-- (a game script switching it back on gets switched off again)
-		watchedLights[light] = true
+		Lamps.watched[light] = true
 		pcall(function()
 			light:GetPropertyChangedSignal("Shadows"):Connect(function()
 				if robloxShadowsOff and alive and light.Shadows then
-					lightShadows[light] = true
+					Lamps.lightShadows[light] = true
 					light.Shadows = false
 				end
 			end)
@@ -7078,7 +7422,7 @@ local function quietLight(light)
 			return light.Shadows
 		end)
 		if ok and was then
-			lightShadows[light] = true
+			Lamps.lightShadows[light] = true
 			pcall(function()
 				light.Shadows = false
 			end)
@@ -7101,12 +7445,12 @@ local function applyRobloxShadows(customOn)
 			end
 		end
 	else
-		for light in pairs(lightShadows) do
+		for light in pairs(Lamps.lightShadows) do
 			pcall(function()
 				light.Shadows = true
 			end)
 		end
-		table.clear(lightShadows)
+		table.clear(Lamps.lightShadows)
 	end
 end
 
@@ -7145,12 +7489,13 @@ local function shutdown()
 	end
 	pcall(Silhouette.destroyAll)
 	pcall(Render.destroyAll)
+	pcall(Diagnostics.destroy)
 	if CONFIG.DisableRobloxShadows then
 		pcall(function()
 			Lighting.GlobalShadows = savedGlobalShadows
 		end)
 		robloxShadowsOff = false
-		for light in pairs(lightShadows) do
+		for light in pairs(Lamps.lightShadows) do
 			pcall(function()
 				light.Shadows = true
 			end)
@@ -7336,6 +7681,7 @@ local function mainLoop()
 		local ok, err = pcall(step, dt)
 		if not ok then
 			errorCount += 1
+			stats.lastError = tostring(err)
 			if errorCount <= 10 then
 				warn("[StencilShadows] " .. tostring(err))
 			end

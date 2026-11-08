@@ -10,7 +10,7 @@ There are two scripts. They are the same script with one setting changed:
 | Script | What it's like |
 | --- | --- |
 | [`src/StencilShadows.client.luau`](src/StencilShadows.client.luau) | **Classic** (2008 to early 2013). Only the sun and moon matter. Lamps are dimmed by shadows like everything else, as in the old engine. |
-| [`src/StencilShadows2013.client.luau`](src/StencilShadows2013.client.luau) | **2013 edition.** PointLights arrived in March 2013 and stencil shadows stayed until early 2014. Lamps (PointLight, SpotLight, SurfaceLight) light up the shadows where they shine, with a softer ring around the light. Things standing in a lamp's light still cast a shadow from the lamp there. (`DynamicLights = true`.) |
+| [`src/StencilShadows2013.client.luau`](src/StencilShadows2013.client.luau) | **2013 edition.** PointLights arrived in March 2013 and stencil shadows stayed until early 2014. Lamps (PointLight, SpotLight, SurfaceLight) light up the shadows where they shine, with a softer ring around the light. Things standing in the light of a lamp whose `Shadows` is on still cast a shadow from the lamp there. (`DynamicLights = true`.) |
 
 ## Setup
 
@@ -43,22 +43,38 @@ There are two scripts. They are the same script with one setting changed:
     and the exact pose all show. The floor can be several parts side by side (tiles, plates).
     When the silhouette is shown, the character draws nothing else on that floor, so there is
     never a double shadow.
+    The silhouette is drawn sharper now (more pixels, especially for the long shadows of a low sun).
   - Where that can't work (the shadow crosses an edge or stairs, or mostly falls inside another
     shadow), each part casts its real outline instead. That outline comes from a hidden copy of
     each mesh with an exact convex-hull collision shape, traced once with raycasts.
-  - Default blocky bodies (R6, and R15 with the default body) are real boxes and are drawn exactly.
-- **Shadows land on players too.**
-  - Blocky bodies take exact shadows, and their sides away from the sun are dark.
-  - The classic head shades like the old head mesh: 16 flat sides lined up with the body (one
-    faces straight ahead, like the torso's front) and rounded ends. Each facet is dark or lit by
-    the same rule as the body's faces, so the face goes dark exactly when the chest does, and the
-    rounded top ends in steps, as in old screenshots.
-  - On package avatars, other heads, hair and hats, each part has a copy of its real mesh that
-    darkens it. In the light, only the side facing away from the sun darkens, as inside the old
-    shadow volumes. Inside a shadow, the whole part darkens.
+  - Layered clothing (3D jackets, pants, shoes) casts no shadow of its own: its mesh only takes its
+    shape on the body, so its outline was a shapeless blob. The body under it casts the shadow.
+  - Default blocky bodies (R6, and R15 with the default body, whose parts come with no mesh) are
+    real boxes and are drawn exactly. (The HumanoidDescription isn't used for this: its body part
+    ids aren't sent to players' computers, so there they always read 0, even for package bodies.)
+- **Players have dark sides, and shadows land on them too.** Every visible part of an avatar gets
+  its dark side from a copy of itself, about one part each, that just follows it. (In-game, the
+  flat dark pieces drawn on avatars before didn't show at all, so the head and body looked
+  unshaded. The copies are drawn far enough off the surface to show on phones and while the
+  avatar animates.)
+  - A block (R6 limbs and torso, the default blocky R15 body) gets a block that reaches out of
+    every side facing away from the sun and stays just inside the sides facing it. Each dark side
+    is darkened evenly, by the same rule as the old shadow volumes.
+  - The classic head gets a copy of the head pushed away from the sun and turned to the nearest
+    edge between the old head mesh's 16 sides (one facing straight ahead, like the chest). Its
+    dark side steps round facet by facet as the sun or the player turns, and the face goes dark
+    exactly when the chest does.
+  - Package bodies, other heads, hair, hats and glasses get a copy of their real mesh, pushed away
+    from the sun, so only the side facing away from it darkens.
+  - Parts under layered clothing (a jacket over the torso and upper arms, pants over the legs,
+    shoes) reach out further (`LayeredClothingThickness`), past the clothing.
+  - Inside a shadow, the whole part darkens. Shadows that fall on blocks and the classic head are
+    drawn exactly, for the three nearest players.
   - Dynamic heads keep their face bones in that copy, so it follows the face.
   - A character that is entirely in shade (indoors, under a roof) is darkened by one Highlight on
-    the real avatar instead, so face, hair, hands and glasses all darken exactly.
+    the real avatar instead, so face, hair, hands and glasses all darken exactly. Only the nearest
+    three get one (`MaxShadeHighlights`): Roblox draws 31 Highlights at most, the game's own
+    included. Everyone else is darkened part by part.
   - Hair and hats don't shadow their own head. Their outline is a blob around the head, so that
     shadow used to black out the whole head.
   - Zoomed into first person, your own character's shadows disappear along with it.
@@ -79,9 +95,16 @@ There are two scripts. They are the same script with one setting changed:
   shadows never lie on top of these. This happens the moment the script starts. If the game
   switches either back on, it goes off again (checked every second as well). Key 9 (or removing the
   script) gives everything back.
-- **Only where Roblox would have a shadow.** Parts with `CastShadow` off, see-through parts,
-  ForceField parts, and parts a game hides on your screen only (`LocalTransparencyModifier`, like a
-  roof that fades when you walk in) cast nothing.
+- **Only where Roblox would have a shadow.**
+  - A game that has its own shadows switched off (`Lighting.GlobalShadows` off when the script
+    starts) gets no sun shadows from the script either, and a short notice says so
+    (`FollowGameShadows`; set it to false to draw them anyway). If the game switches its shadows on
+    later, the stencil shadows appear.
+  - Parts with `CastShadow` off, see-through parts, ForceField parts, and parts a game hides on
+    your screen only (`LocalTransparencyModifier`, like a roof that fades when you walk in) cast
+    nothing.
+  - Lamps (2013 edition) cast shadows only if their own `Shadows` is on, like in Roblox (it's off
+    by default on new lights). A lamp with `Shadows` off still lights things up.
 - **Shadows load right away, nearest first.** There is no start-up pause and no loading screen;
   the shadows near you appear within the first moments and the rest follow as you walk. (The
   start-up pause and whole-map loading from earlier versions are still there as `LoadPause` and
@@ -100,9 +123,9 @@ There are two scripts. They are the same script with one setting changed:
 - **Sun and moon.** Shadows follow the sun, or the moon at night. When neither is up they hide.
 - **Lamps (2013 edition).** PointLights shine all around; SpotLights and SurfaceLights only inside
   their cone (`Angle`, `Face`). Where a lamp shines strongly (`LightPoolSize` of its Range), the
-  sun's shadow is taken away, with a ring at half darkness around it (`LightFade`). Parts between
-  the lamp and a surface keep a full shadow there, pointing away from the lamp, and the ring
-  doesn't stack on it. The same goes for shadows on terrain, round parts' dark sides, and
+  sun's shadow is taken away, with a ring at half darkness around it (`LightFade`). If the light
+  has `Shadows` on, parts between the lamp and a surface keep a full shadow there, pointing away
+  from the lamp, and the ring doesn't stack on it. The same goes for shadows on terrain, round parts' dark sides, and
   characters: a player standing in a lamp's light gets no dark sides and no sun silhouette there.
   Switching, moving or changing a lamp redraws what it reaches.
 - **Smooth while walking around.** Shadows that look the same at every level of detail (blocks on
@@ -110,6 +133,11 @@ There are two scripts. They are the same script with one setting changed:
   player are worked out once instead of every frame, and the silhouette's floor check runs only
   when the shadow has moved.
 - **Toggle** with 9. Turning it off hides the shadows and restores `Lighting.GlobalShadows`.
+- **Something looks wrong?** Set `ShowDiagnostics = true` at the top of the script. A small box in
+  the corner then says what the script sees: whether the sun (or the game's shadow setting) allows
+  shadows, your avatar's parts and head, how many dark-side copies are showing, whether your floor
+  shadow is the exact silhouette (and if not, why not), the number of Highlights in the game, and
+  the last error. A screenshot of it shows what's going on.
 
 ## Settings
 
@@ -132,13 +160,17 @@ All settings are in the `CONFIG` table at the top of the script.
 | `WholeMapPauseMax` | `20` | The longest the pause may last for a whole map, in seconds (`LoadPauseMax`, 5, otherwise). |
 | `ShadowDistance` | `520` | On bigger maps, map shadows are kept within this many studs of the camera. |
 | `PartsShadowDistance` | `300` | The same, when drawing with parts because EditableMesh is off. |
+| `FollowGameShadows` | `true` | A game with its own shadows switched off (`Lighting.GlobalShadows`) gets no sun shadows either. |
 | `ShadeBackFaces` | `true` | Darken the sides of parts that face away from the sun. |
 | `GlowingPartsStayLit` | `true` | Neon parts are never darkened. |
 | `ExactSilhouettes` | `true` | On flat lit floors, characters cast their exact silhouette (ViewportFrame). |
 | `MaxSilhouettes` | `4` | How many characters (nearest first) can have one at a time. |
 | `AvatarOutlines` | `true` | Elsewhere, cast avatars' real outlines, using hidden hull copies of their meshes. |
-| `ShadowsOnAvatars` | `true` | Darken avatars' body parts, heads, hair and hats. |
-| `CharacterSurfaceOffset` | `0.012` | How far shadows float off characters (the map uses `SurfaceOffset`, 0.04). |
+| `ShadowsOnAvatars` | `true` | Avatars' dark sides, and darkening where they stand in shadow. |
+| `MaxShadeHighlights` | `3` | Characters (nearest first) fully in shade that get one Highlight; the rest are darkened part by part. |
+| `CharacterSurfaceOffset` | `0.035` | How far shadows landing on characters float off them, plus 0.001 per stud of camera distance (the map uses `SurfaceOffset`, 0.04). |
+| `CharacterShadeOffset` | `0.04` | How far a body part's dark side reaches out of it, plus 0.001 per stud of camera distance. |
+| `LayeredClothingThickness` | `0.1` | How far it reaches out of parts under layered clothing. |
 | `TransparentShadows` | `false` | See-through parts cast lighter shadows tinted with their color. |
 | `MinShadowElevation` | `8` | A sun lower than this many degrees is raised, so shadows don't stretch forever. |
 | `MaxShadowLength` | `600` | How far past its caster a shadow can reach. |
@@ -147,6 +179,7 @@ All settings are in the `CONFIG` table at the top of the script.
 | `MobileFrameBudget` | `2.5` | The same on phones and tablets. |
 | `LoadingTime` | `8` | Seconds after the start during which `LoadingBudget` (9 ms) may be used. |
 | `IgnoreAttribute` | `"NoStencilShadow"` | Set this attribute to `true` on a part or model to leave it out. |
+| `ShowDiagnostics` | `false` | A small box in the corner says what the script sees (to screenshot when something looks wrong). |
 
 On phones, lower `MobileFrameBudget` or `PartsShadowDistance` if the game still feels heavy.
 
@@ -221,7 +254,8 @@ What that means inside a building:
   - Building takes about twice the CPU time, because overlaps are cut on the CPU.
 - **Highlight style.** Roblox draws at most 31 Highlights at once, and draws them without
   anti-aliasing ([DevForum feature request](https://devforum.roblox.com/t/anti-aliasing-for-highlight-instances/1862811)).
-  The fully shaded character uses a Highlight in both styles.
+  A fully shaded character uses a Highlight in both styles (the nearest three at most). If the
+  game itself uses many Highlights, the balls' dark-side layer (one Highlight) may not be drawn.
 - **Mesh data.** Reading a MeshPart's mesh needs permission for that asset, usually yours or your
   group's. Other meshes fall back to a raycast-sampled outline, which is convex, so holes in such
   meshes are filled in.
@@ -232,43 +266,60 @@ What that means inside a building:
   - Away from a flat floor each body part casts its convex outline, so a gap inside one part
     (between hair spikes, say) is filled in there.
   - The silhouette is a texture, so its edges are a little softer. Layered clothing isn't part of
-    it and isn't darkened.
-  - In the light, a body part either darkens as a whole or only on its dark side. A shadow edge
-    can't cut across it.
+    it.
+  - Layered clothing has no copy of its own (it only takes its shape on the body). The parts under
+    it reach out by `LayeredClothingThickness` instead: a puffier coat can still hide that, and a
+    tight shirt shows it floating a hair off the cloth up close.
+  - A pushed copy pokes out past the outline of a head or mesh a little on its dark side
+    (about 0.05 studs up close).
+  - Package bodies, hair and hats: in the light, they either darken as a whole or only on their
+    dark side; a shadow edge can't cut across them. (Blocks and the classic head take exact
+    shadows, for the three nearest players.)
   - Hair and hats don't cast shadows on their own character.
   - Dynamic heads: Roblox's skinning wasn't available to test here. If a dynamic head's copy
     still doesn't draw, the whole-character Highlight still covers it in shade.
-- **Lamps (2013 edition).** Only still parts cast shadows from lamps (not players). A lamp's pool
-  is a disc or cone with one softer ring, not Roblox's exact falloff. Lamps' own Roblox shadows
-  are switched off, since these replace them.
+- **Lamps (2013 edition).** Only still parts cast shadows from lamps (not players), and only lamps
+  whose `Shadows` was on. A lamp's pool is a disc or cone with one softer ring, not Roblox's exact
+  falloff. Lamps' own Roblox shadows are switched off, since these replace them.
+- **Following the game's shadows.** Only the game's setting when the script starts, or switching
+  shadows on later, is seen: a game that switches its shadows off later (say at night) keeps the
+  stencil shadows, because the script keeps Roblox's own off already.
 - **Not tested in Roblox itself.** The requester tests each version in a real game on a phone. The
-  fixes in this version were checked with the Luau parser, linter and simulation suite below.
+  fixes in this version were checked with the Luau parser, linter and simulation suite below, on a
+  rebuilt copy of the requester's avatar (R15 blocky body, classic head, spiky hair, sunglasses,
+  layered jacket).
 
 ## Testing
 
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 73 scenarios compare the shadow triangles it draws against independently computed projections.
+The 78 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover:
 
 - Every shape, clipping, parts sunk into the floor, shadows falling 450 studs.
 - Moving and resting parts, vehicles, removal, building tools.
-- Characters: R6, R15, packages, blocky bodies, the classic head, first person, avatar outlines
-  from hull copies, package avatars darkening in shadow, dark sides on heads.
+- Characters: R6, R15, packages, blocky bodies (found by their missing meshes, not the
+  HumanoidDescription), the classic head, first person, avatar outlines from hull copies, package
+  avatars darkening in shadow. Dark sides: block copies reaching out of exactly the sides facing
+  away from the sun, the head's copy turned to a facet edge with the face going dark together with
+  the chest, no flat pieces on dark sides, and a full avatar with spiky hair, sunglasses and a
+  layered jacket (parts under the jacket reach past it, the jacket casts no blob).
 - The exact silhouette (every body point's shadow lands at the same spot on the canvas and in the
   camera image), its fallbacks, and a floor made of two parts.
 - Hair not blacking out its own head, hair getting its own shading, dynamic heads keeping their
-  bones, the one Highlight for a character entirely in shade, and the classic head's facets going
-  dark together with the torso's faces.
+  bones, the one Highlight for a character entirely in shade (the nearest three at most).
 - Blocky balls (each classic facet dark or lit as a whole, tight on the ball, the classic outline,
   dark all over under a roof), with EditableMesh and with parts.
 - The Direct style: no overlaps anywhere on the floor, across floor tiles, after a part moves, on
   players, and between a lamp's ring and its shadows; the same coverage as the Highlight style;
   0.001-stud pieces; balls with their ball-shaped middle.
 - Lamps in the 2013 edition (lit pool, softer ring, a crate's shadow from the lamp, switching off,
-  spot and surface lights lighting only their cone, a player in a lamp's light), the classic script
-  ignoring them, and lamps' own Roblox shadows switched off and back on with key 9.
+  spot and surface lights lighting only their cone, a player in a lamp's light, a light with
+  `Shadows` off lighting things up without casting shadows), the classic script ignoring them, and
+  lamps' own Roblox shadows switched off and back on with key 9.
+- A game with its own shadows off getting none (and getting them once it switches them on), and
+  the diagnostics box.
 - Walking around a kept map: only shadows that depend on the level of detail are rebuilt.
 - No pause by default (shadows and Roblox's shadows switched off from the first frames), Roblox's
   shadows switched back off within a second when a script sneaks them on, floors with `CanQuery`
