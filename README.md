@@ -55,9 +55,14 @@ There are two scripts. They are the same script with one setting changed:
     falls inside another shadow), the outlines are used.
   - Layered clothing (3D jackets, pants, shoes) casts no shadow of its own: its mesh only takes its
     shape on the body, so its outline was a shapeless blob. The body under it casts the shadow.
-  - Default blocky bodies (R6, and R15 with the default body, whose parts come with no mesh) are
-    real boxes and are drawn exactly. (The HumanoidDescription isn't used for this: its body part
-    ids aren't sent to players' computers, so there they always read 0, even for package bodies.)
+  - Default blocky bodies are real boxes and are drawn exactly, with corners. R6 limbs are blocks;
+    an R15 limb is taken for a box when it has no mesh, when its mesh traces as a plain box, or
+    (before it's traced, or if it can't be) when the player's avatar has no package for that limb.
+    The script asks Roblox which limbs of each player's avatar come from a package (once per
+    player, in the background). A package limb that only traces as a plain box (its real shape
+    couldn't be read) gets a rounded stand-in instead, so a package never looks blocky. (The
+    HumanoidDescription isn't used: its body part ids aren't sent to players' computers, so there
+    they always read 0.)
 - **Players have dark sides, and shadows land on them too.** Every visible part of an avatar gets
   its dark side from a copy of itself, about one part each, that just follows it. (In-game, the
   flat dark pieces drawn on avatars before didn't show at all, so the head and body looked
@@ -103,10 +108,11 @@ There are two scripts. They are the same script with one setting changed:
   script) gives everything back.
 - **Only where Roblox would have a shadow.**
   - A game that has its own shadows switched off (`Lighting.GlobalShadows` off when the script
-    starts) gets no sun shadows from the script either, and a notice titled "Stencil Shadows" says:
-    "This game doesn't have shadows enabled. This script cannot work without shadows."
-    (`FollowGameShadows`; set it to false to draw them anyway.) If the game switches its shadows on
-    later, the stencil shadows appear.
+    starts) gets no sun shadows from the script either, and a notice titled "Stencil Shadows" asks:
+    "This game doesn't have shadows enabled. This script cannot work without shadows. Enable
+    shadows anyway?" with Yes and No buttons. Yes draws the stencil shadows anyway; No (or letting
+    the notice go) leaves the game without them. (`FollowGameShadows = false` always draws them.)
+    If the game switches its shadows on later, the stencil shadows appear.
   - Parts with `CastShadow` off, see-through parts, ForceField parts, and parts a game hides on
     your screen only (`LocalTransparencyModifier`, like a roof that fades when you walk in) cast
     nothing.
@@ -118,6 +124,10 @@ There are two scripts. They are the same script with one setting changed:
   nothing loads while you walk around. A map bigger than the limits (`WholeMapParts`, 12,000
   parts with EditableMesh; `PartsWholeMapParts`, 4,000 parts without) loads around you as you
   walk instead.
+  - While it loads, a counter like Roblox's own notification boxes sits on the right of the screen
+    (above the jump button on phones): "Stencil Shadows", "Loading shadows... 63%", how many
+    parts are done ("1,234 of 1,950 parts") and a bar. Its Hide button puts it away; it slides
+    away by itself once everything is built (`LoadingCounter = false` never shows it).
   - When everything is built, a notice titled "Stencil Shadows" says so: "Loading complete: the
     whole map's shadows are ready (12 s)." (On a map too big for that: "Loading complete: the
     shadows around you are ready (5 s). This map is too big to load all at once, so farther
@@ -175,6 +185,7 @@ All settings are in the `CONFIG` table at the top of the script.
 | `LoadPause` | `false` | Freeze at the start until nearby shadows are built (off: it made joining laggy). |
 | `LoadWholeMap` | `true` | Build the whole map in the background and keep it, unless it's bigger than the limits below. |
 | `LoadingMessage` | `true` | A notice once the shadows have finished loading. |
+| `LoadingCounter` | `true` | A counter (with a Hide button) on the right of the screen while they load. |
 | `WholeMapParts` | `12000` | Most parts for a whole-map load with EditableMesh. |
 | `PartsWholeMapParts` | `4000` | The same when drawing with parts. |
 | `WholeMapPauseMax` | `20` | The longest the pause may last for a whole map, in seconds (`LoadPauseMax`, 5, otherwise). |
@@ -318,7 +329,7 @@ What that means inside a building:
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 84 scenarios compare the shadow triangles it draws against independently computed projections.
+The 88 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover:
 
 - Every shape, clipping, parts sunk into the floor, shadows falling 450 studs.
@@ -349,7 +360,11 @@ They cover:
   time to spare, a package whose meshes can only be traced as boxes not casting a blocky shadow,
   and hidden faces of an avatar's blocks skipped.
 - The whole map loading in the background with no pause (far islands too), the "Loading complete"
-  notice said exactly once, and a map too big for that saying so.
+  notice said exactly once, and a map too big for that saying so; the loading counter counting up,
+  hiding with its button, and going once loading is complete.
+- The no-shadows notice's Yes and No buttons.
+- A blocky player whose limbs have box meshes casting boxes, whether the meshes can be traced or
+  not, and a package limb that only traces as a box casting a rounded stand-in.
 - Walking around a kept map: only shadows that depend on the level of detail are rebuilt.
 - No pause by default (shadows and Roblox's shadows switched off from the first frames), Roblox's
   shadows switched back off within a second when a script sneaks them on, floors with `CanQuery`

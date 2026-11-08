@@ -156,6 +156,7 @@ local CONFIG = {
 	                                      -- background (no pause), and kept: nothing loads while
 	                                      -- you walk around (bigger maps load around you as you go)
 	LoadingMessage = true,                -- a notice once the shadows have finished loading
+	LoadingCounter = true,                -- a counter at the top of the screen while they load
 	WholeMapParts = 12000,                -- most parts for a whole-map load with EditableMesh...
 	PartsWholeMapParts = 4000,            -- ...and when drawing with parts
 	WholeMapPauseMax = 20,                -- seconds the pause may last for a whole-map load
@@ -2038,16 +2039,28 @@ do
 	-- BodyShade), so nothing ever sticks out of the avatar.
 	local function avatarMeshShape(state, part, size, lod)
 		local name = part.Name
-		local bodyPart = DESC_FIELD[name] ~= nil and not state.accessory
+		local field = DESC_FIELD[name]
+		local bodyPart = field ~= nil and not state.accessory
 		state.polyReceive = nil
 		local content = part.MeshContent
 		local uri = content and content.Uri
-		if bodyPart and (uri == nil or uri == "") then
-			-- the default blocky R15 body: its parts come with no mesh at all and really are
-			-- boxes (its dark sides from block copies, shadows on it drawn exactly)
+		-- is this limb from a package (by the player's avatar), or the default blocky body?
+		-- (nil: not known yet)
+		local info = state.charInfo
+		local packages = (bodyPart and info) and info.packages or nil
+		local fromPackage = nil
+		if type(packages) == "table" then
+			fromPackage = packages[field] == true
+		end
+		local function blockyPart()
+			-- the default blocky R15 body: its parts really are boxes (dark sides from block
+			-- copies, shadows on them drawn exactly)
 			state.shadeKind = "box"
 			state.polyReceive = true
 			return Shapes.box(size)
+		end
+		if bodyPart and (uri == nil or uri == "") then
+			return blockyPart() -- (no mesh at all)
 		end
 		-- body parts, hair and hats: dark sides and shade from copies of their real mesh
 		state.shadeKind = "mesh"
@@ -2061,11 +2074,17 @@ do
 		end
 		-- 2. a hidden copy of the mesh with an exact hull collision shape, raycast once per mesh
 		local probe = MeshProbe.get(content, state)
-		if probe and probe.status == "ready" and not probe.boxy then
-			return Shapes.fromPoints("h" .. probe.key, probe.pts, size, ZERO, false)
+		if probe and probe.status == "ready" then
+			if not probe.boxy then
+				return Shapes.fromPoints("h" .. probe.key, probe.pts, size, ZERO, false)
+			elseif bodyPart and not fromPackage then
+				return blockyPart() -- its mesh really is a box: the default blocky body
+			end
+			-- (a package limb that traced as a plain box: its real shape couldn't be read - it
+			-- gets the rounded stand-in below, not a blocky outline)
+		elseif bodyPart and fromPackage == false then
+			return blockyPart() -- not traced yet, but the avatar has no package there
 		end
-		-- (a probe that came back a plain box means its real shape couldn't be traced - a package
-		-- arm isn't a box: it gets the rounded stand-in below, not a blocky outline)
 		-- 3. the avatar's own collision shape, unless that's just a box (it usually is)
 		if CONFIG.RaySampleMeshes and (probe == nil or probe.status == "dead") then
 			local key = rayKey(part, content)
@@ -6755,9 +6774,49 @@ do
 		LeftShoe = {"LeftFoot"}, RightShoe = {"RightFoot"},
 	}
 
-	-- What the avatar is wearing: R6 package meshes (CharacterMesh), and the body parts under
-	-- layered clothing. (Not the HumanoidDescription: its body part ids aren't sent to players'
-	-- computers, so there they always read 0.)
+	-- Which of a player's limbs come from a package, from their avatar (asked once per player, in
+	-- the background): the others are the default blocky body. false: couldn't be asked.
+	local appearance = {}
+	local asking = {}
+	local LIMB_TYPES = {Torso = true, LeftArm = true, RightArm = true, LeftLeg = true, RightLeg = true}
+	local LIMB_ORDER = {"Torso", "LeftArm", "RightArm", "LeftLeg", "RightLeg"}
+	local function packagesOf(model)
+		local player = Players:GetPlayerFromCharacter(model)
+		if not player then
+			return nil
+		end
+		local id = player.UserId
+		local known = appearance[id]
+		if known ~= nil then
+			return known or nil
+		end
+		if not asking[id] then
+			asking[id] = true
+			task.spawn(function()
+				local ok, data = pcall(function()
+					return Players:GetCharacterAppearanceInfoAsync(id)
+				end)
+				local set = false
+				if ok and type(data) == "table" and type(data.assets) == "table" then
+					set = {}
+					for _, asset in ipairs(data.assets) do
+						local kind = type(asset) == "table" and asset.assetType
+						local name = type(kind) == "table" and kind.name
+						if LIMB_TYPES[name] then
+							set[name] = true
+						end
+					end
+				end
+				appearance[id] = set
+				newCharacter = true -- (read the bodies again)
+			end)
+		end
+		return nil
+	end
+
+	-- What the avatar is wearing: R6 package meshes (CharacterMesh), packages on R15 limbs, and the
+	-- body parts under layered clothing. (Not the HumanoidDescription: its body part ids aren't
+	-- sent to players' computers, so there they always read 0.)
 	local function readBody(model)
 		local meshes, covered, sig = nil, nil, ""
 		for _, child in ipairs(model:GetChildren()) do
@@ -6784,16 +6843,25 @@ do
 				end
 			end
 		end
-		return meshes, covered, sig
+		local packages = packagesOf(model)
+		if packages then
+			sig = sig .. "|p"
+			for _, name in ipairs(LIMB_ORDER) do
+				if packages[name] then
+					sig = sig .. name .. ","
+				end
+			end
+		end
+		return meshes, covered, sig, packages
 	end
 
 	function refreshCharacters()
 		for model, info in pairs(characters) do
 			info.isLocal = LocalPlayer ~= nil and LocalPlayer.Character == model
-			local meshes, covered, sig = readBody(model)
+			local meshes, covered, sig, packages = readBody(model)
 			local bodyChanged = sig ~= info.bodySig
 			if bodyChanged then
-				info.bodySig, info.charMeshes, info.covered = sig, meshes, covered
+				info.bodySig, info.charMeshes, info.covered, info.packages = sig, meshes, covered, packages
 				info.dirty = true
 			end
 			for _, st in ipairs(info.members) do
@@ -6938,9 +7006,14 @@ do
 		else
 			lines[#lines + 1] = "you: no character found"
 		end
-		lines[#lines + 1] = (stats.loaded and string.format("loading: complete (%s)",
-			wholeMap and "the whole map" or "the area around you"))
-			or string.format("loading: %d areas to go%s", stats.areasLeft or 0, wholeMap and " (whole map)" or "")
+		if stats.loaded then
+			lines[#lines + 1] = string.format("loading: complete (%s)", wholeMap and "the whole map" or "the area around you")
+		else
+			local share, done, total = Diagnostics.progress()
+			lines[#lines + 1] = string.format("loading: %d%%%s%s", math.floor(share * 100),
+				done and string.format(" (%s of %s parts)", Diagnostics.commas(done), Diagnostics.commas(total)) or "",
+				wholeMap and ", whole map" or "")
+		end
 		lines[#lines + 1] = string.format("shadow parts: %d | Highlights in the game: %d (Roblox draws 31)",
 			stats.wedges, Diagnostics.highlights)
 		lines[#lines + 1] = string.format("errors: %d%s", errorCount,
@@ -6949,9 +7022,10 @@ do
 	end
 
 	-- A short on-screen notice (once), for things the player should know about. (hint: extra
-	-- words for the output window only; news: good news, printed rather than warned)
+	-- words for the output window only; news: good news, printed rather than warned; ask: a
+	-- function that gets "Yes" or "No" - the notice then has those two buttons)
 	local told = {}
-	function Diagnostics.notifyOnce(key, text, hint, news)
+	function Diagnostics.notifyOnce(key, text, hint, news, ask)
 		if told[key] then
 			return
 		end
@@ -6962,13 +7036,19 @@ do
 		else
 			warn(line)
 		end
+		local payload = {Title = "Stencil Shadows", Text = text, Duration = ask and 30 or 10}
+		if ask then
+			local answer = Instance.new("BindableFunction")
+			answer.OnInvoke = function(choice)
+				ask(choice)
+			end
+			payload.Button1, payload.Button2, payload.Callback = "Yes", "No", answer
+		end
 		-- (SetCore can refuse while the game is still starting up: tried again a few times)
 		task.spawn(function()
 			for _ = 1, 10 do
 				local ok = pcall(function()
-					game:GetService("StarterGui"):SetCore("SendNotification", {
-						Title = "Stencil Shadows", Text = text, Duration = 10,
-					})
+					game:GetService("StarterGui"):SetCore("SendNotification", payload)
 				end)
 				if ok or not alive then
 					return
@@ -6978,11 +7058,211 @@ do
 		end)
 	end
 
+	-- How far loading has got: the share done (0..1), parts done, parts in all. First the map's
+	-- parts are read (the first tenth), then their shadows are built (the rest).
+	function Diagnostics.progress()
+		if not initialScanDone then
+			local total = max(addQ.tail, 1)
+			local done = math.clamp(addQ.head - 1, 0, total)
+			return 0.1 * done / total, nil, nil
+		end
+		local done, total = 0, 0
+		for _, ch in pairs(chunks) do
+			if ch.active then
+				local lod = ch.lod
+				for _, st in ipairs(ch.list) do
+					if st.isCaster and not st.dead and not st.dynamic then
+						total += 1
+						local rec = st.casterRec
+						-- (a part that failed for good counts as done, or it would never get there)
+						if (st.fails or 0) >= 4 or (rec and not st.dirty and rec.lightVersion == Light.version
+							and (rec.lod == lod or rec.lodDep == false)) then
+							done += 1
+						end
+					end
+				end
+			end
+		end
+		return 0.1 + 0.9 * (total > 0 and done / total or 1), done, total
+	end
+
+	-- 1234567 -> "1,234,567"
+	local function commas(n)
+		local s = tostring(math.floor(n))
+		local sign = ""
+		if string.sub(s, 1, 1) == "-" then
+			sign, s = "-", string.sub(s, 2)
+		end
+		local out = ""
+		while #s > 3 do
+			out = "," .. string.sub(s, -3) .. out
+			s = string.sub(s, 1, #s - 3)
+		end
+		return sign .. s .. out
+	end
+	Diagnostics.commas = commas
+
+	-- The loading counter: a box like Roblox's own notifications, on the right of the screen (above
+	-- the jump button on phones) - "Loading shadows... 63%", how many parts are done, a bar, and a
+	-- Hide button - while the map loads. It slides away once everything is built, or when hidden.
+	local counter = {gui = nil, last = -1, best = -1, bestAt = 0, dismissed = false}
+	local touch = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+	local SHOWN = touch and UDim2.new(1, -16, 1, -190) or UDim2.new(1, -16, 1, -16)
+	local AWAY = touch and UDim2.new(1, 300, 1, -190) or UDim2.new(1, 300, 1, -16)
+
+	local function slide(box, to, done)
+		local ok = pcall(function()
+			local tween = game:GetService("TweenService"):Create(box,
+				TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Position = to})
+			if done then
+				tween.Completed:Connect(done)
+			end
+			tween:Play()
+		end)
+		if not ok then
+			box.Position = to
+			if done then
+				done()
+			end
+		end
+	end
+
+	local function text(parent, name, y, size, font, color)
+		local l = Instance.new("TextLabel")
+		l.Name = name
+		l.BackgroundTransparency = 1
+		l.Position = UDim2.fromOffset(12, y)
+		l.Size = UDim2.new(1, -24, 0, size + 4)
+		l.Font = font
+		l.TextSize = size
+		l.TextColor3 = color
+		l.TextXAlignment = Enum.TextXAlignment.Left
+		l.TextTruncate = Enum.TextTruncate.AtEnd
+		l.Text = ""
+		l.Parent = parent
+		return l
+	end
+
+	local function counterBox()
+		local gui = counter.gui
+		if gui and gui.Parent then
+			return counter
+		end
+		local pg = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		if not pg then
+			return nil
+		end
+		if gui then
+			pcall(gui.Destroy, gui)
+		end
+		gui = Instance.new("ScreenGui")
+		gui.Name = "StencilShadowsLoading"
+		gui.ResetOnSpawn = false
+		gui.DisplayOrder = 999
+		local box = Instance.new("Frame")
+		box.Name = "Counter"
+		box.AnchorPoint = Vector2.new(1, 1)
+		box.Position = AWAY
+		box.Size = UDim2.fromOffset(260, 112)
+		box.BackgroundColor3 = Color3.fromRGB(28, 30, 33)
+		box.BackgroundTransparency = 0.15
+		box.BorderSizePixel = 0
+		box.Parent = gui
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 10)
+		corner.Parent = box
+		local white, grey = Color3.new(1, 1, 1), Color3.fromRGB(190, 192, 196)
+		counter.title = text(box, "Title", 9, 15, Enum.Font.GothamBold, white)
+		counter.title.Text = "Stencil Shadows"
+		counter.line = text(box, "Text", 29, 13, Enum.Font.Gotham, white)
+		counter.detail = text(box, "Detail", 46, 11, Enum.Font.Gotham, grey)
+		local track = Instance.new("Frame")
+		track.Name = "Track"
+		track.Position = UDim2.fromOffset(12, 65)
+		track.Size = UDim2.new(1, -24, 0, 4)
+		track.BackgroundColor3 = Color3.new(1, 1, 1)
+		track.BackgroundTransparency = 0.82
+		track.BorderSizePixel = 0
+		track.Parent = box
+		local bar = Instance.new("Frame")
+		bar.Name = "Bar"
+		bar.Size = UDim2.fromScale(0, 1)
+		bar.BackgroundColor3 = Color3.fromRGB(255, 214, 89)
+		bar.BorderSizePixel = 0
+		bar.Parent = track
+		counter.bar = bar
+		local hide = Instance.new("TextButton")
+		hide.Name = "Hide"
+		hide.Position = UDim2.fromOffset(12, 77)
+		hide.Size = UDim2.new(1, -24, 0, 26)
+		hide.BackgroundColor3 = Color3.fromRGB(64, 67, 72)
+		hide.BackgroundTransparency = 0.1
+		hide.BorderSizePixel = 0
+		hide.AutoButtonColor = true
+		hide.Font = Enum.Font.GothamMedium
+		hide.TextSize = 13
+		hide.TextColor3 = white
+		hide.Text = "Hide"
+		hide.Parent = box
+		local hc = Instance.new("UICorner")
+		hc.CornerRadius = UDim.new(0, 6)
+		hc.Parent = hide
+		hide.Activated:Connect(function()
+			-- hidden for the rest of this load (the "Loading complete" notice still comes)
+			counter.dismissed = true
+			Diagnostics.hideCounter()
+		end)
+		counter.box = box
+		gui.Parent = pg
+		counter.gui = gui
+		slide(box, SHOWN)
+		return counter
+	end
+
+	function Diagnostics.showProgress(now)
+		if counter.dismissed or now - counter.last < 0.4 then
+			return
+		end
+		counter.last = now
+		local share, done, total = Diagnostics.progress()
+		-- (stuck for a whole minute - something can't be built: the counter stops showing)
+		if share > counter.best + 1e-4 then
+			counter.best, counter.bestAt = share, now
+		elseif now - counter.bestAt > 60 then
+			Diagnostics.hideCounter()
+			return
+		end
+		local c = counterBox()
+		if not c then
+			return
+		end
+		local pct = math.clamp(math.floor(share * 100), 0, 99)
+		c.line.Text = string.format("Loading shadows... %d%%", pct)
+		c.detail.Text = done and string.format("%s of %s parts", commas(done), commas(total))
+			or "Reading the map"
+		c.bar.Size = UDim2.fromScale(math.clamp(share, 0, 1), 1)
+	end
+
+	function Diagnostics.hideCounter()
+		local gui, box = counter.gui, counter.box
+		if gui then
+			counter.gui, counter.box = nil, nil
+			if box and box.Parent then
+				slide(box, AWAY, function()
+					pcall(gui.Destroy, gui)
+				end)
+			else
+				pcall(gui.Destroy, gui)
+			end
+		end
+	end
+
 	function Diagnostics.destroy()
 		if Diagnostics.gui then
 			pcall(Diagnostics.gui.Destroy, Diagnostics.gui)
 			Diagnostics.gui, Diagnostics.label = nil, nil
 		end
+		Diagnostics.hideCounter()
 	end
 end
 
@@ -7442,7 +7722,13 @@ do
 		end
 		if Light.gameOff then
 			Diagnostics.notifyOnce("gameoff", "This game doesn't have shadows enabled. This script cannot work "
-				.. "without shadows.", "(Set FollowGameShadows = false in the script to draw them anyway.)")
+				.. "without shadows. Enable shadows anyway?", "(Or set FollowGameShadows = false in the script.)",
+				false, function(choice)
+					if choice == "Yes" and alive then
+						-- drawn anyway, from the next frame on
+						CONFIG.FollowGameShadows = false
+					end
+				end)
 		end
 		if CONFIG.ShowDiagnostics then
 			safeCall(Diagnostics.update, now)
@@ -7813,6 +8099,14 @@ local function mainLoop()
 				warn("[StencilShadows] " .. tostring(res))
 			end
 		end
+		-- the loading counter at the top of the screen, while the shadows load
+		if not stats.loaded then
+			if enabled and Light.valid and CONFIG.LoadingCounter then
+				safeCall(Diagnostics.showProgress, clock())
+			else
+				Diagnostics.hideCounter()
+			end
+		end
 		-- loading finished: everything there is to build is built (and stays so for half a second,
 		-- so a gap between two batches doesn't count). Said once.
 		if not stats.loaded and ok and res == true and enabled and Light.valid and initialScanDone
@@ -7820,6 +8114,7 @@ local function mainLoop()
 			doneFrames += 1
 			if doneFrames >= 30 then
 				stats.loaded = true
+				Diagnostics.hideCounter()
 				stats.loadSeconds = clock() - loadStart
 				if CONFIG.LoadingMessage then
 					local secs = math.max(1, math.floor(stats.loadSeconds + 0.5))
