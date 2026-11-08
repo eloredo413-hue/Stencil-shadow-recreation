@@ -139,8 +139,16 @@ There are two scripts. They are the same script with one setting changed:
     a grid of its own for them.
   - If a part's shadow fails to build (something unusual about it), it's tried again a few seconds
     later instead of being skipped for good.
-  - On phones and tablets the script uses less time each frame (`MobileFrameBudget`), and the
-    bigger loading budget is only used in the first seconds.
+  - Loading is fast: until the first load is complete, the script uses up to 9 ms a frame
+    (`LoadingBudget`; 6 ms on phones, `MobileLoadingBudget`), as long as the game keeps running
+    above about 36 fps. After that it goes back to a small budget (`FrameBudget`, 4.2 ms;
+    `MobileFrameBudget`, 2.5 ms on phones), so walking into new areas of a big map doesn't stutter.
+  - Each shadow only looks at the parts actually in its way. Seen along the sunlight, a part can
+    only shadow what lies right behind its own outline, so still parts are filed in a grid by where
+    they are seen from the sun, and a shadow looks up a few grid cells. (It used to ask Roblox for
+    every part in a box reaching 600 studs toward the sun; seen from the side that box covers most
+    of a map, so Roblox tested nearly every part each time. In a test town of 800 parts loading is
+    about 3.5 times faster, with exactly the same shadows.)
 - **Building tools work.** Parts spawned, cloned, dragged, resized or deleted (BTools, F3X, scripts)
   get their shadows updated by the next frame.
 - **Moving things update every frame**: characters, unanchored parts, vehicles (one shadow job per
@@ -210,7 +218,8 @@ All settings are in the `CONFIG` table at the top of the script.
 | `Backend` | `"Auto"` | `"EditableMesh"`, `"Parts"`, or automatic. |
 | `FrameBudget` | `4.2` | Milliseconds of shadow work per frame. |
 | `MobileFrameBudget` | `2.5` | The same on phones and tablets. |
-| `LoadingTime` | `8` | Seconds after the start during which `LoadingBudget` (9 ms) may be used. |
+| `LoadingBudget` | `9` | Milliseconds of work per frame until the first load is complete (above about 36 fps). |
+| `MobileLoadingBudget` | `6` | The same on phones and tablets. |
 | `IgnoreAttribute` | `"NoStencilShadow"` | Set this attribute to `true` on a part or model to leave it out. |
 | `ShowDiagnostics` | `false` | A small box in the corner says what the script sees (to screenshot when something looks wrong). |
 
@@ -245,7 +254,9 @@ are drawn with `"EditableMesh"` or `"Parts"`, and `GetStats().wholeMap` whether 
    lamp (projected from the lamp's position).
 6. **Scheduling.** Still parts are bucketed into 64-stud chunks that load nearest-first, a few
    milliseconds each frame. Maps within the whole-map limits are built completely and kept; on
-   bigger ones, chunks unload when far away.
+   bigger ones, chunks unload when far away. To find what a shadow falls on (and what else
+   shadows the same spot), still parts are also filed in a 16-stud grid in light space (across the
+   sunlight), refiled when the sun moves.
    Moving parts and characters have their own per-frame jobs.
 
 ## Indoors: how the old stencil shadows behaved
@@ -329,7 +340,7 @@ What that means inside a building:
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 88 scenarios compare the shadow triangles it draws against independently computed projections.
+The 89 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover:
 
 - Every shape, clipping, parts sunk into the floor, shadows falling 450 studs.
@@ -363,6 +374,7 @@ They cover:
   notice said exactly once, and a map too big for that saying so; the loading counter counting up,
   hiding with its button, and going once loading is complete.
 - The no-shadows notice's Yes and No buttons.
+- Loading a town of 800 parts without a single box query (the light-space grid).
 - A blocky player whose limbs have box meshes casting boxes, whether the meshes can be traced or
   not, and a package limb that only traces as a box casting a rounded stand-in.
 - Walking around a kept map: only shadows that depend on the level of detail are rebuilt.

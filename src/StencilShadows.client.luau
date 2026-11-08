@@ -133,8 +133,9 @@ local CONFIG = {
 	-- Performance -------------------------------------------------------------------------------
 	FrameBudget = 4.2,                    -- milliseconds of work per frame
 	MobileFrameBudget = 2.5,              -- the same on phones and tablets (they have less to spare)
-	LoadingBudget = 9,                    -- milliseconds per frame in the first seconds after start
-	LoadingTime = 8,                      -- ...that many seconds (not every time new areas load)
+	LoadingBudget = 9,                    -- milliseconds per frame until the first load is complete
+	MobileLoadingBudget = 6,              -- the same on phones (both only while the game runs above
+	                                      -- about 36 fps; slower frames get the normal budget)
 	RegisterPerFrame = 4000,              -- instances scanned per frame at startup (also time-limited)
 	PollPerFrame = 250,                   -- resting unanchored parts checked for movement per frame
 
@@ -2655,6 +2656,149 @@ do
 		return out
 	end
 end
+-- Still parts filed by where they are seen from the light. Seen along the light, a part can only
+-- shadow what lies right behind its own outline, and only be shadowed by what lies right in front of
+-- it - so "what could shadow this / what could this shadow" is a few cells of a flat grid, not a
+-- box query reaching 600 studs toward the sun (which had Roblox test most of the map every time:
+-- that's what made loading slow). Filed again when the light moves.
+local LightGrid = {cells = {}, big = {}, entries = {}, lightVersion = -1, stamp = 0}
+do
+	local CELL = 16
+	local MAX_CELLS = 256      -- a part covering more cells than this goes on the "big" list
+
+	-- the part's box in light space (with room for a special mesh bigger than its part)
+	local function lightBox(st)
+		local part = st.part
+		local cf, size = part.CFrame, part.Size
+		local a, b, L = Light.a, Light.b, Light.L
+		local r, u, l = cf.RightVector * (size.X * 0.5), cf.UpVector * (size.Y * 0.5), cf.LookVector * (size.Z * 0.5)
+		local p = cf.Position
+		local pad = 0.05
+		if not part:IsA("MeshPart") and part:FindFirstChildWhichIsA("DataModelMesh") then
+			pad = max(4, size.Magnitude)
+		end
+		local ca, cb, cl = p:Dot(a), p:Dot(b), p:Dot(L)
+		local ea = abs(r:Dot(a)) + abs(u:Dot(a)) + abs(l:Dot(a)) + pad
+		local eb = abs(r:Dot(b)) + abs(u:Dot(b)) + abs(l:Dot(b)) + pad
+		local el = abs(r:Dot(L)) + abs(u:Dot(L)) + abs(l:Dot(L)) + pad
+		return {ca - ea, ca + ea, cb - eb, cb + eb, cl - el, cl + el}
+	end
+
+	local function file(st)
+		local e = lightBox(st)
+		local ix0, ix1 = floor(e[1] / CELL), floor(e[2] / CELL)
+		local iy0, iy1 = floor(e[3] / CELL), floor(e[4] / CELL)
+		if (ix1 - ix0 + 1) * (iy1 - iy0 + 1) > MAX_CELLS then
+			e.big = true
+			LightGrid.big[st] = true
+		else
+			local keys = {}
+			local cells = LightGrid.cells
+			for ix = ix0, ix1 do
+				for iy = iy0, iy1 do
+					local k = (ix + 32768) * 65536 + (iy + 32768)
+					local cell = cells[k]
+					if not cell then
+						cell = {}
+						cells[k] = cell
+					end
+					cell[st] = true
+					keys[#keys + 1] = k
+				end
+			end
+			e.keys = keys
+		end
+		LightGrid.entries[st] = e
+	end
+
+	local function fileable(st)
+		return not st.dead and not st.dynamic and not st.character and (st.isCaster or st.isReceiver)
+	end
+
+	function LightGrid.remove(st)
+		local e = LightGrid.entries[st]
+		if not e then
+			return
+		end
+		LightGrid.entries[st] = nil
+		if e.big then
+			LightGrid.big[st] = nil
+		else
+			local cells = LightGrid.cells
+			for _, k in ipairs(e.keys) do
+				local cell = cells[k]
+				if cell then
+					cell[st] = nil
+					if next(cell) == nil then
+						cells[k] = nil
+					end
+				end
+			end
+		end
+	end
+
+	-- A still part appeared, changed or came to rest (or stopped being one).
+	function LightGrid.update(st)
+		LightGrid.remove(st)
+		if fileable(st) and LightGrid.lightVersion == Light.version then
+			file(st)
+		end
+	end
+
+	-- Still parts (their states) whose light-space box overlaps this one (in Light.a / b / L
+	-- coordinates, as queryBox takes them).
+	function LightGrid.query(minX, maxX, minY, maxY, minZ, maxZ)
+		if LightGrid.lightVersion ~= Light.version then
+			-- the light moved: everything filed again
+			LightGrid.cells, LightGrid.big, LightGrid.entries = {}, {}, {}
+			LightGrid.lightVersion = Light.version
+			for _, st in pairs(states) do
+				if fileable(st) then
+					file(st)
+				end
+			end
+		end
+		local stamp = LightGrid.stamp + 1
+		LightGrid.stamp = stamp
+		local entries = LightGrid.entries
+		local out, n = {}, 0
+		local function take(st)
+			if st.lgStamp ~= stamp then
+				st.lgStamp = stamp
+				local e = entries[st]
+				if e and e[2] >= minX and e[1] <= maxX and e[4] >= minY and e[3] <= maxY and e[6] >= minZ
+					and e[5] <= maxZ then
+					n += 1
+					out[n] = st
+				end
+			end
+		end
+		for st in pairs(LightGrid.big) do
+			take(st)
+		end
+		local ix0, ix1 = floor(minX / CELL), floor(maxX / CELL)
+		local iy0, iy1 = floor(minY / CELL), floor(maxY / CELL)
+		if (ix1 - ix0 + 1) * (iy1 - iy0 + 1) > 4096 then
+			for st in pairs(entries) do
+				take(st)
+			end
+		else
+			local cells = LightGrid.cells
+			for ix = ix0, ix1 do
+				for iy = iy0, iy1 do
+					local cell = cells[(ix + 32768) * 65536 + (iy + 32768)]
+					if cell then
+						for st in pairs(cell) do
+							take(st)
+						end
+					end
+				end
+			end
+		end
+		return out
+	end
+end
+
 local Out = {pts = {}, sizes = {}, tints = {}, np = 0, nPoly = 0, cores = {}, nCores = 0}
 
 do
@@ -4391,10 +4535,10 @@ do
 		-- the shadows that come first on this face: still casters between it and the light, over
 		-- these polygons (a query around them, so a huge baseplate costs no more than a small part)
 		local cover = {}
-		local near = queryBox(x0 - MARGIN, x1 + MARGIN, y0 - MARGIN, y1 + MARGIN,
+		local near = LightGrid.query(x0 - MARGIN, x1 + MARGIN, y0 - MARGIN, y1 + MARGIN,
 			wf.minZ - CONFIG.MaxShadowLength, wf.maxZ + MARGIN)
 		for i = 1, #near do
-			local c = states[near[i]]
+			local c = near[i]
 			if c and c ~= receiver and c.isCaster and not c.dead and not c.dynamic and first(c) then
 				local cshape = getShape(c, lod)
 				if cshape then
@@ -4528,10 +4672,10 @@ do
 					touched = {}
 					rec.receivers = touched
 				end
-				local parts = queryBox(g.minX - MARGIN, g.maxX + MARGIN, g.minY - MARGIN, g.maxY + MARGIN,
+				local parts = LightGrid.query(g.minX - MARGIN, g.maxX + MARGIN, g.minY - MARGIN, g.maxY + MARGIN,
 					g.minZ - MARGIN, g.maxZ + CONFIG.MaxShadowLength)
 				for i = 1, #parts do
-					local r = states[parts[i]]
+					local r = parts[i]
 					if r and r ~= state and r.isReceiver and not r.dynamic then
 						local rshape = getShape(r, lod)
 						if rshape and (rshape.kind == "round" or rshape.blocky) then
@@ -4625,13 +4769,13 @@ do
 				end
 			end
 			if ng > 0 then
-				local parts = queryBox(minX - MARGIN, maxX + MARGIN, minY - MARGIN, maxY + MARGIN,
+				local parts = LightGrid.query(minX - MARGIN, maxX + MARGIN, minY - MARGIN, maxY + MARGIN,
 					minZ - MARGIN, maxZ + CONFIG.MaxShadowLength)
 				-- the floor plane showing the exact silhouette gets no polygons from this character
 				local plane = owner.silPlane
 				local pn, pd = plane and plane.n, plane and plane.d
 				for i = 1, #parts do
-					local r = states[parts[i]]
+					local r = parts[i]
 					if r and r.isReceiver and not r.dynamic then
 						local rshape = getShape(r, lod)
 						if rshape and rshape.faces then
@@ -6404,6 +6548,7 @@ do
 			end
 			addToChunk(state)
 			NoQuery.update(state)
+			LightGrid.update(state)
 			if initialScanDone and state.isReceiver then
 				queueUpstream(state)
 			end
@@ -6412,6 +6557,7 @@ do
 
 	function unregister(state)
 		NoQuery.remove(state.part)
+		LightGrid.remove(state)
 		if state.dead then
 			return
 		end
@@ -6463,6 +6609,7 @@ do
 		dynamicStates[state] = true
 		removeFromChunk(state)
 		NoQuery.remove(state.part)
+		LightGrid.remove(state)
 		markDependentsDirty(state)
 	end
 
@@ -6483,6 +6630,7 @@ do
 		state.lastCF = state.part.CFrame
 		addToChunk(state)
 		NoQuery.update(state)
+		LightGrid.update(state)
 		if state.isReceiver then
 			queueUpstream(state)
 		end
@@ -6508,6 +6656,7 @@ do
 			return
 		end
 		NoQuery.update(state)
+		LightGrid.update(state)
 		if state.isCaster and not state.chunk then
 			addToChunk(state)
 		elseif not state.isCaster and state.chunk then
@@ -6701,10 +6850,10 @@ do
 			if not st.dead and st.isReceiver and not st.dynamic and Light.valid then
 				local part = st.part
 				local x0, x1, y0, y1, z0, z1 = boxLightBounds(part.CFrame, part.Size)
-				local parts = queryBox(x0 - MARGIN, x1 + MARGIN, y0 - MARGIN, y1 + MARGIN,
+				local parts = LightGrid.query(x0 - MARGIN, x1 + MARGIN, y0 - MARGIN, y1 + MARGIN,
 					z0 - CONFIG.MaxShadowLength - 1, z1 + MARGIN)
 				for i = 1, #parts do
-					local c = states[parts[i]]
+					local c = parts[i]
 					if c and c ~= st and c.chunk then
 						markDirty(c)
 					end
@@ -7274,7 +7423,7 @@ do
 	local lastTerrainCheck = -100
 	local lastCharacterRefresh = 0
 	local wholeMapChecked = nil
-	local startClock, lastShadowCheck = nil, nil
+	local lastShadowCheck = nil
 	-- a phone or tablet (touch, no keyboard): less time to spare each frame
 	local touchOnly = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
@@ -7699,13 +7848,14 @@ do
 	function step(dt, budgetMs, warm)
 		frameId += 1
 		local now = clock()
-		RaySample.budget = warm and 40 or 3
-		-- the bigger loading budget only in the first seconds (walking into new areas used it too,
-		-- which made phones stutter); phones get a lighter budget all along
-		startClock = startClock or now
-		local loading = (not initialScanDone or staticHead <= #staticQueue) and now - startClock < CONFIG.LoadingTime
+		-- until the first load is complete, a bigger budget - as long as the game keeps running
+		-- smoothly (above about 36 fps). After that (walking into new areas of a big map) the
+		-- normal small one, so phones don't stutter.
+		local firstLoad = not stats.loaded
+		RaySample.budget = warm and 40 or (firstLoad and 10 or 3)
 		local frameBudget = touchOnly and CONFIG.MobileFrameBudget or CONFIG.FrameBudget
-		local budget = budgetMs or ((loading and dt < 1 / 40) and CONFIG.LoadingBudget or frameBudget)
+		local loadBudget = touchOnly and CONFIG.MobileLoadingBudget or CONFIG.LoadingBudget
+		local budget = budgetMs or ((firstLoad and dt < 1 / 36) and max(loadBudget, frameBudget) or frameBudget)
 		-- Roblox's own shadows stay off (a game script may keep switching them on)
 		if started and enabled and CONFIG.DisableRobloxShadows and now - (lastShadowCheck or 0) > 1 then
 			lastShadowCheck = now
