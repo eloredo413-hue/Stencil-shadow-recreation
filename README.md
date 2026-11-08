@@ -157,6 +157,11 @@ There are two scripts. They are the same script with one setting changed:
   smooth surfaces, goes on the stud script's list of parts it has already done
   (`_G.RetroTrackedParts`), and any texture or decal another script puts on a shadow is taken off
   again.
+- **Shadows keep their material.** Scripts that set every part's material (all SmoothPlastic, say)
+  can't change the shadows': each shadow piece sets its material straight back (Neon, which stays
+  flat black whatever the light; plastic would be lit and shiny), while the map's own parts change
+  as that script wants. Against a script that keeps setting it, a piece gives up after 20 times a
+  second rather than the two fighting forever.
 - **Moving things update every frame**: characters, unanchored parts, vehicles (one shadow job per
   assembly) and tweened parts. You, the nearest other player and the two nearest moving things are
   redrawn every frame they move, however little time there is to spare, so their shadows never
@@ -346,7 +351,7 @@ What that means inside a building:
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 90 scenarios compare the shadow triangles it draws against independently computed projections.
+The 91 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover:
 
 - Every shape, clipping, parts sunk into the floor, shadows falling 450 studs.
@@ -381,7 +386,8 @@ They cover:
   hiding with its button, and going once loading is complete.
 - The no-shadows notice's Yes and No buttons.
 - Loading a town of 800 parts without a single box query (the light-space grid).
-- A stud script's textures kept off the shadows.
+- A stud script's textures kept off the shadows, and an "all SmoothPlastic" script unable to change
+  the shadows' material.
 - A blocky player whose limbs have box meshes casting boxes, whether the meshes can be traced or
   not, and a package limb that only traces as a box casting a rounded stand-in.
 - Walking around a kept map: only shadows that depend on the level of detail are rebuilt.

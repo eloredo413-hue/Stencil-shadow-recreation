@@ -3341,7 +3341,24 @@ do
 		p.CastShadow = false
 		p.Massless = true
 		p.Locked = true
-		p.Material = layer.material
+		local material = layer.material
+		p.Material = material
+		-- a script that sets every part's material (all SmoothPlastic, say) can't change a shadow's:
+		-- it's set straight back. (At most 20 times a second, so it never fights such a script
+		-- forever.)
+		local fixes, since = 0, 0
+		p:GetPropertyChangedSignal("Material"):Connect(function()
+			if p.Material ~= material then
+				local now = clock()
+				if now - since > 1 then
+					since, fixes = now, 0
+				end
+				fixes += 1
+				if fixes <= 20 then
+					p.Material = material
+				end
+			end
+		end)
 		p.Color = layer.color
 		p.Transparency = layer.transparency
 		-- retro stud scripts put stud textures on every part whose surfaces aren't smooth: a
