@@ -37,16 +37,22 @@ There are two scripts. They are the same script with one setting changed:
     a small Highlight of their own, so they can overlap.)
   - A ball's shadow on the ground has the classic facets' outline.
   - `RoundShading = "Smooth"` gives the smooth version instead.
-- **Characters cast their exact silhouette**, R6 and R15, with packages, hats, hair and tools.
-  - On a still, flat floor in the light, a black copy of the character is drawn as seen from the
-    sun, in a ViewportFrame on a SurfaceGui lying on the floor. Hair spikes, hats, clothing, tools
-    and the exact pose all show. The floor can be several parts side by side (tiles, plates).
-    When the silhouette is shown, the character draws nothing else on that floor, so there is
-    never a double shadow.
-    The silhouette is drawn sharper now (more pixels, especially for the long shadows of a low sun).
-  - Where that can't work (the shadow crosses an edge or stairs, or mostly falls inside another
-    shadow), each part casts its real outline instead. That outline comes from a hidden copy of
-    each mesh with an exact convex-hull collision shape, traced once with raycasts.
+- **Characters cast their shadow**, R6 and R15, with packages, hats, hair and tools.
+  - Each part casts its real outline, rebuilt every frame the character moves, so the shadow
+    stays at its feet. That outline comes from a hidden copy of each mesh with an exact
+    convex-hull collision shape, traced once with raycasts. If a mesh can only be traced as a plain
+    box (its real shape couldn't be read), it gets a rounded stand-in of its size instead, so a
+    package never casts a blocky shadow.
+  - On a computer, a player standing still on a flat floor in the light casts their exact
+    silhouette instead: a black copy of the character drawn as seen from the sun, in a
+    ViewportFrame on a SurfaceGui lying on the floor. Hair spikes, hats, clothing, tools and the
+    exact pose all show, and the floor can be several parts side by side (tiles, plates). Roblox
+    updates that GUI a little late, so a walking player's silhouette trailed behind them and
+    jumped about: it's only used while standing still (`SilhouetteOnlyWhenStill`). Phones draw it
+    blocky and late, so they always use the outlines (`SilhouettesOnPhones`).
+  - When the silhouette is shown, the character draws nothing else on that floor, so there is
+    never a double shadow. Where it can't work (the shadow crosses an edge or stairs, or mostly
+    falls inside another shadow), the outlines are used.
   - Layered clothing (3D jackets, pants, shoes) casts no shadow of its own: its mesh only takes its
     shape on the body, so its outline was a shapeless blob. The body under it casts the shadow.
   - Default blocky bodies (R6, and R15 with the default body, whose parts come with no mesh) are
@@ -97,8 +103,9 @@ There are two scripts. They are the same script with one setting changed:
   script) gives everything back.
 - **Only where Roblox would have a shadow.**
   - A game that has its own shadows switched off (`Lighting.GlobalShadows` off when the script
-    starts) gets no sun shadows from the script either, and a short notice says so
-    (`FollowGameShadows`; set it to false to draw them anyway). If the game switches its shadows on
+    starts) gets no sun shadows from the script either, and a notice titled "Stencil Shadows" says:
+    "This game doesn't have shadows enabled. This script cannot work without shadows."
+    (`FollowGameShadows`; set it to false to draw them anyway.) If the game switches its shadows on
     later, the stencil shadows appear.
   - Parts with `CastShadow` off, see-through parts, ForceField parts, and parts a game hides on
     your screen only (`LocalTransparencyModifier`, like a roof that fades when you walk in) cast
@@ -119,7 +126,11 @@ There are two scripts. They are the same script with one setting changed:
 - **Building tools work.** Parts spawned, cloned, dragged, resized or deleted (BTools, F3X, scripts)
   get their shadows updated by the next frame.
 - **Moving things update every frame**: characters, unanchored parts, vehicles (one shadow job per
-  assembly) and tweened parts. A part that stops moving goes back into the map's shadows.
+  assembly) and tweened parts. You, the nearest other player and the two nearest moving things are
+  redrawn every frame they move, however little time there is to spare, so their shadows never
+  trail behind them; the rest when there's time. A part that stops moving goes back into the
+  map's shadows. Faces of an avatar's blocks tucked inside another block (the legs' tops under
+  the torso) get no shadows worked out, which keeps walking smooth.
 - **Sun and moon.** Shadows follow the sun, or the moon at night. When neither is up they hide.
 - **Lamps (2013 edition).** PointLights shine all around; SpotLights and SurfaceLights only inside
   their cone (`Angle`, `Face`). Where a lamp shines strongly (`LightPoolSize` of its Range), the
@@ -164,6 +175,8 @@ All settings are in the `CONFIG` table at the top of the script.
 | `ShadeBackFaces` | `true` | Darken the sides of parts that face away from the sun. |
 | `GlowingPartsStayLit` | `true` | Neon parts are never darkened. |
 | `ExactSilhouettes` | `true` | On flat lit floors, characters cast their exact silhouette (ViewportFrame). |
+| `SilhouetteOnlyWhenStill` | `true` | Only while the player stands still (a walking player's would trail behind). |
+| `SilhouettesOnPhones` | `false` | Phones draw it blocky and late, so they use the outlines. |
 | `MaxSilhouettes` | `4` | How many characters (nearest first) can have one at a time. |
 | `AvatarOutlines` | `true` | Elsewhere, cast avatars' real outlines, using hidden hull copies of their meshes. |
 | `ShadowsOnAvatars` | `true` | Avatars' dark sides, and darkening where they stand in shadow. |
@@ -263,10 +276,11 @@ What that means inside a building:
   mesh can be read and is small enough (`MeshReceiverTriangles`). Otherwise, flat meshes and unions
   use their bounding box.
 - **Avatars.**
-  - Away from a flat floor each body part casts its convex outline, so a gap inside one part
-    (between hair spikes, say) is filled in there.
-  - The silhouette is a texture, so its edges are a little softer. Layered clothing isn't part of
-    it.
+  - Each body part casts its convex outline, so a gap inside one part (between hair spikes, say)
+    is filled in. That's the shadow on phones, and on a computer while the player walks or stands
+    off a flat floor.
+  - The exact silhouette (computers, standing still) is a texture, so its edges are a little
+    softer. Layered clothing isn't part of it.
   - Layered clothing has no copy of its own (it only takes its shape on the body). The parts under
     it reach out by `LayeredClothingThickness` instead: a puffier coat can still hide that, and a
     tight shirt shows it floating a hair off the cloth up close.
@@ -294,7 +308,7 @@ What that means inside a building:
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 78 scenarios compare the shadow triangles it draws against independently computed projections.
+The 83 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover:
 
 - Every shape, clipping, parts sunk into the floor, shadows falling 450 studs.
@@ -318,8 +332,12 @@ They cover:
   spot and surface lights lighting only their cone, a player in a lamp's light, a light with
   `Shadows` off lighting things up without casting shadows), the classic script ignoring them, and
   lamps' own Roblox shadows switched off and back on with key 9.
-- A game with its own shadows off getting none (and getting them once it switches them on), and
-  the diagnostics box.
+- A game with its own shadows off getting none, with the notice's exact words (and getting them
+  once it switches them on), and the diagnostics box.
+- A walking player's shadow at their feet every frame (the silhouette only once they stand
+  still), phones using the outlines, the nearest moving thing's shadow keeping up with it with no
+  time to spare, a package whose meshes can only be traced as boxes not casting a blocky shadow,
+  and hidden faces of an avatar's blocks skipped.
 - Walking around a kept map: only shadows that depend on the level of detail are rebuilt.
 - No pause by default (shadows and Roblox's shadows switched off from the first frames), Roblox's
   shadows switched back off within a second when a script sneaks them on, floors with `CanQuery`

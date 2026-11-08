@@ -23,8 +23,9 @@
 	   of parts that face away from the light are dark, as if inside the old shadow volumes.
 	   Only parts Roblox would give a shadow cast one (CastShadow on, not see-through or hidden),
 	   and only in games that have shadows switched on (FollowGameShadows).
-	 * Characters cast their exact silhouette on flat floors (a black copy seen from the light),
-	   and real avatar outlines elsewhere. Their dark sides come from copies of their parts: a
+	 * Characters cast their real outlines, rebuilt every frame they move (and, on a computer,
+	   their exact silhouette - a black copy seen from the light - while standing still on a flat
+	   floor). Their dark sides come from copies of their parts: a
 	   block that reaches out of a body block's dark sides, and copies of heads (in the old head's
 	   facet steps), hair and meshes pushed away from the light; a character fully in shade is
 	   darkened by one Highlight.
@@ -111,6 +112,9 @@ local CONFIG = {
 	AccessoryShadows = true,
 	AvatarOutlines = true,                -- real avatar outlines from hidden hull copies of their meshes
 	ExactSilhouettes = true,              -- on flat lit floors, characters cast their exact silhouette
+	SilhouetteOnlyWhenStill = true,       -- ...only while standing still: drawn through a GUI, it
+	                                      -- trails behind a walking player (polygons don't)
+	SilhouettesOnPhones = false,          -- phones draw it blocky and late: they use polygons
 	MaxSilhouettes = 4,                   -- characters (nearest first) that can have one at a time
 	ShadowsOnAvatars = true,              -- avatars get their dark sides and darken in shadow
 	MaxShadeHighlights = 3,               -- characters (nearest first) darkened by one Highlight
@@ -2054,15 +2058,11 @@ do
 		end
 		-- 2. a hidden copy of the mesh with an exact hull collision shape, raycast once per mesh
 		local probe = MeshProbe.get(content, state)
-		if probe and probe.status == "ready" then
-			if bodyPart and probe.boxy then
-				-- a body part whose mesh is a plain box after all (blocky bodies)
-				state.shadeKind = "box"
-				state.polyReceive = true
-				return Shapes.box(size)
-			end
+		if probe and probe.status == "ready" and not probe.boxy then
 			return Shapes.fromPoints("h" .. probe.key, probe.pts, size, ZERO, false)
 		end
+		-- (a probe that came back a plain box means its real shape couldn't be traced - a package
+		-- arm isn't a box: it gets the rounded stand-in below, not a blocky outline)
 		-- 3. the avatar's own collision shape, unless that's just a box (it usually is)
 		if CONFIG.RaySampleMeshes and (probe == nil or probe.status == "dead") then
 			local key = rayKey(part, content)
@@ -2109,7 +2109,7 @@ do
 			state.shadeKind = "charmesh"
 			local okContent, content = pcall(Content.fromUri, "rbxassetid://" .. tostring(meshId))
 			local probe = okContent and MeshProbe.get(content, state) or nil
-			if probe and probe.status == "ready" then
+			if probe and probe.status == "ready" and not probe.boxy then
 				return Shapes.fromPoints("h" .. probe.key, probe.pts, probe.size, ZERO, false)
 			end
 			return Shapes.roundedBlock(size, BODY_ROUNDING[name] or 0.35)
@@ -2180,7 +2180,7 @@ do
 					-- and its shading from copies of it (see BodyShade)
 					state.shadeKind = "part"
 					local probe = MeshProbe.get(mesh.MeshContent, state)
-					if probe and probe.status == "ready" then
+					if probe and probe.status == "ready" and not probe.boxy then
 						return Shapes.fromPoints("h" .. probe.key, probe.pts, probe.size * scale, offset, false)
 					end
 				end
@@ -4292,6 +4292,39 @@ do
 		end
 	end
 
+	-- A polygon's bounding box (kept with it): pieces that can't touch aren't cut against each
+	-- other (on a character, most shadows on one plane - say every front face - are far apart).
+	local function boundsOf(pc)
+		local b = pc.b
+		if not b then
+			local xs, ys = pc[1], pc[2]
+			local x0, x1, y0, y1 = huge, -huge, huge, -huge
+			for i = 1, pc[3] do
+				local x, y = xs[i], ys[i]
+				if x < x0 then
+					x0 = x
+				end
+				if x > x1 then
+					x1 = x
+				end
+				if y < y0 then
+					y0 = y
+				end
+				if y > y1 then
+					y1 = y
+				end
+			end
+			b = {x0, x1, y0, y1}
+			pc.b = b
+		end
+		return b
+	end
+
+	local function apart(p, q)
+		local a, b = boundsOf(p), boundsOf(q)
+		return a[2] <= b[1] or b[2] <= a[1] or a[4] <= b[3] or b[4] <= a[3]
+	end
+
 	-- The polygons this caster just put on `wf` (Out from `from` on) lose whatever earlier ones
 	-- on the same face already cover: `others` (casters that come first) and its own earlier ones.
 	-- `first(c)`: does caster c come before this one? `rec` (still records) is redrawn when they move.
@@ -4419,11 +4452,15 @@ do
 				against[#against + 1] = q
 			end
 			for _, q in ipairs(against) do
-				if (q[4] == "dim") == (pc[4] == "dim") then
+				if (q[4] == "dim") == (pc[4] == "dim") and not apart(pc, q) then
 					ccwPoly(q)
 					local nextPieces = {}
 					for _, piece in ipairs(pieces) do
-						cutAway(piece[1], piece[2], piece[3], q[1], q[2], q[3], piece[4], nextPieces)
+						if apart(piece, q) then
+							nextPieces[#nextPieces + 1] = piece
+						else
+							cutAway(piece[1], piece[2], piece[3], q[1], q[2], q[3], piece[4], nextPieces)
+						end
 					end
 					pieces = nextPieces
 					if #pieces == 0 then
@@ -4608,6 +4645,37 @@ do
 	end
 
 	local RECV = {}
+	-- Is this face of an avatar's block tucked inside another of its blocks (the top of a leg under
+	-- the torso, the end of a forearm in the hand)? Nothing would show there, so no shadows are
+	-- worked out for it. (Checked a few times a second: joints don't come apart while walking.)
+	local function buried(owner, st, f, wf, now)
+		local list = st.buriedList
+		if not list or now - (st.buriedAt or 0) > 0.3 then
+			list = st.buriedList or {}
+			table.clear(list)
+			st.buriedList, st.buriedAt = list, now
+		end
+		local known = list[f]
+		if known ~= nil then
+			return known
+		end
+		local p = wf.o + wf.n * 0.06
+		local inside = false
+		for _, q in ipairs(owner.members) do
+			if q ~= st and q.shadeKind == "box" and not q.dead and q.isReceiver then
+				local part = q.part
+				local lp = part.CFrame:PointToObjectSpace(p)
+				local hs = part.Size * 0.5
+				if abs(lp.X) < hs.X and abs(lp.Y) < hs.Y and abs(lp.Z) < hs.Z then
+					inside = true
+					break
+				end
+			end
+		end
+		list[f] = inside
+		return inside
+	end
+
 	-- Hair (or a helmet) wraps around the head: its outline is a blob holding the whole head, so
 	-- its "shadow" would black out the head and lie like a dark collar on the shoulders. Hair and
 	-- hats don't shadow their own character (they still shadow everything else).
@@ -4664,12 +4732,14 @@ do
 					end
 				end
 				-- face by face, so the shadows landing on one face can be kept from stacking
+				local now = clock()
 				for k = 1, nr do
 					local st = RECV[k]
 					local faces = st.wf
+					local boxy = st.shadeKind == "box"
 					for f = 1, #faces do
 						local wf = faces[f]
-						if wf.s > MIN_LIT then
+						if wf.s > MIN_LIT and not (boxy and buried(owner, st, f, wf, now)) then
 							local from = Out.nPoly + 1
 							for i = 1, #casters do
 								local c = casters[i]
@@ -6045,7 +6115,7 @@ do
 		view.cam.FieldOfView = math.deg(2 * math.atan(W * 0.5 / dist))
 		-- the canvas: its front face lies on the floor; across it runs v, along it runs u. Sharp
 		-- enough across and along the shadow (a low sun stretches it out: more pixels then)
-		local px = math.clamp(math.floor(max(W * 56, Lu * 40) + 0.5), 128, 900)
+		local px = math.clamp(math.floor(max(W * 56, Lu * 40) + 0.5), 128, 512)
 		if view.gui.CanvasSize.X ~= px then
 			view.gui.CanvasSize = Vector2.new(px, px)
 		end
@@ -6872,18 +6942,28 @@ do
 		label.Text = table.concat(lines, "\n")
 	end
 
-	-- A short on-screen notice (once), for things the player should know about.
+	-- A short on-screen notice (once), for things the player should know about. (hint: extra
+	-- words for the output window only)
 	local told = {}
-	function Diagnostics.notifyOnce(key, text)
+	function Diagnostics.notifyOnce(key, text, hint)
 		if told[key] then
 			return
 		end
 		told[key] = true
-		warn("[StencilShadows] " .. text)
-		pcall(function()
-			game:GetService("StarterGui"):SetCore("SendNotification", {
-				Title = "Stencil shadows", Text = text, Duration = 8,
-			})
+		warn("[StencilShadows] " .. text .. (hint and (" " .. hint) or ""))
+		-- (SetCore can refuse while the game is still starting up: tried again a few times)
+		task.spawn(function()
+			for _ = 1, 10 do
+				local ok = pcall(function()
+					game:GetService("StarterGui"):SetCore("SendNotification", {
+						Title = "Stencil Shadows", Text = text, Duration = 10,
+					})
+				end)
+				if ok or not alive then
+					return
+				end
+				task.wait(1)
+			end
 		end)
 	end
 
@@ -7138,6 +7218,29 @@ do
 		return moved
 	end
 
+	-- Is this character standing still (its root hasn't moved for a moment)?
+	local function standingStill(info, now)
+		local root = characterRoot(info)
+		if not root then
+			return false
+		end
+		local pos = root.Position
+		local last, lastAt = info.stillPos, info.stillAt
+		info.stillPos, info.stillAt = pos, now
+		if not last or not lastAt then
+			info.stillSince = nil
+			return false
+		end
+		local dt = now - lastAt
+		local speed = dt > 1e-4 and (pos - last).Magnitude / dt or 0
+		if speed > 0.6 then
+			info.stillSince = nil
+			return false
+		end
+		info.stillSince = info.stillSince or now
+		return now - info.stillSince >= 0.35
+	end
+
 	local function processDynamic(camPos, now, deadline)
 		-- characters: the local player first, then the nearest
 		local nc = 0
@@ -7161,17 +7264,26 @@ do
 		for i = 1, nc do
 			local info = CHAR_LIST[i]
 			local lod = info.dist < CONFIG.NearDetail and 1 or 2
-			local inBudget = i == 1 or clock() < deadline
+			-- (you and the nearest other player are redrawn every frame, so their shadows never
+			-- trail behind them; the rest when there's time)
+			local inBudget = i <= 2 or clock() < deadline
 			-- a character standing perfectly still keeps its shadows (animated ones always move)
 			local moved = characterMoved(info)
-			-- its exact silhouette on the floor, when that fits (the polygons then skip that floor)
+			-- its exact silhouette on the floor, when that fits (the polygons then skip that floor).
+			-- It's drawn through a GUI, which Roblox updates a little late: only for a player
+			-- standing still (a walking one's would trail behind), and not on phones (blocky there)
 			local silFloor = nil
+			local still = standingStill(info, now)
 			if CONFIG.ExactSilhouettes and CONFIG.CharacterShadows and silhouettes < CONFIG.MaxSilhouettes
-				and info.dist <= CONFIG.ReceiverDistance then
+				and info.dist <= CONFIG.ReceiverDistance and (CONFIG.SilhouettesOnPhones or not touchOnly)
+				and (still or not CONFIG.SilhouetteOnlyWhenStill) then
 				silhouettes += 1
 				silFloor = safeCall(Silhouette.update, info, characterRoot(info))
 			else
 				Silhouette.hide(info)
+				info.silWhy = not CONFIG.ExactSilhouettes and "switched off"
+					or ((touchOnly and not CONFIG.SilhouettesOnPhones) and "not used on phones")
+					or (not still and "moving") or "too many / too far"
 			end
 			if silFloor ~= info.silFloor then
 				info.silFloor = silFloor
@@ -7264,7 +7376,9 @@ do
 				moving += 1
 				local rec = grp.casterRec
 				local changed = grp.sig ~= grp.builtSig or grp.ids ~= grp.builtIds or grp.retry
-				if (changed or not rec or rec.lightVersion ~= Light.version or rec.lod ~= lod) and clock() < deadline then
+				-- (the nearest two moving things every frame, so their shadows keep up with them)
+				if (changed or not rec or rec.lightVersion ~= Light.version or rec.lod ~= lod)
+					and (moving <= 2 or clock() < deadline) then
 					safeCall(buildDynamicCaster, grp, grp.members, lod)
 					grp.builtSig, grp.builtIds = grp.sig, grp.ids
 				end
@@ -7315,8 +7429,8 @@ do
 			end
 		end
 		if Light.gameOff then
-			Diagnostics.notifyOnce("gameoff", "This game has its shadows switched off, so no sun shadows are drawn "
-				.. "(set FollowGameShadows = false in the script to draw them anyway).")
+			Diagnostics.notifyOnce("gameoff", "This game doesn't have shadows enabled. This script cannot work "
+				.. "without shadows.", "(Set FollowGameShadows = false in the script to draw them anyway.)")
 		end
 		if CONFIG.ShowDiagnostics then
 			safeCall(Diagnostics.update, now)
