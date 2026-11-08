@@ -19,8 +19,8 @@
 	   shadows overlap on a surface one is cut away, so nothing is ever darker than one shadow -
 	   which is exactly what made stencil shadows look the way they did. ("Highlight" instead
 	   merges everything with one Highlight, whose edges look jagged on phones.)
-	 * Shadows near you appear right away and the rest load as you walk (nearest first, inside a
-	   small per-frame time budget). Moving parts, vehicles and characters are rebuilt whenever
+	 * Shadows near you appear right away and the rest of the map loads in the background (nearest
+	   first, inside a small per-frame time budget, no pause), with a notice when it's done. Moving parts, vehicles and characters are rebuilt whenever
 	   they move. Shadows also land on players and loose parts, drape over terrain, and the sides
 	   of parts that face away from the light are dark, as if inside the old shadow volumes.
 	   Only parts Roblox would give a shadow cast one (CastShadow on, not see-through or hidden),
@@ -152,9 +152,10 @@ local CONFIG = {
 	                                      -- built (off: it made the start laggy)
 	LoadPauseMax = 5,                     -- seconds the start-up pause may last at most
 	LoadPauseSlice = 1.2,                 -- it freezes in slices this long, with one frame between
-	LoadWholeMap = false,                 -- maps up to the size below are built completely during
-	                                      -- the pause and kept: nothing loads while you walk around
-	                                      -- (bigger maps load around you as you go)
+	LoadWholeMap = true,                  -- maps up to the size below are built completely, in the
+	                                      -- background (no pause), and kept: nothing loads while
+	                                      -- you walk around (bigger maps load around you as you go)
+	LoadingMessage = true,                -- a notice once the shadows have finished loading
 	WholeMapParts = 12000,                -- most parts for a whole-map load with EditableMesh...
 	PartsWholeMapParts = 4000,            -- ...and when drawing with parts
 	WholeMapPauseMax = 20,                -- seconds the pause may last for a whole-map load
@@ -6937,6 +6938,9 @@ do
 		else
 			lines[#lines + 1] = "you: no character found"
 		end
+		lines[#lines + 1] = (stats.loaded and string.format("loading: complete (%s)",
+			wholeMap and "the whole map" or "the area around you"))
+			or string.format("loading: %d areas to go%s", stats.areasLeft or 0, wholeMap and " (whole map)" or "")
 		lines[#lines + 1] = string.format("shadow parts: %d | Highlights in the game: %d (Roblox draws 31)",
 			stats.wedges, Diagnostics.highlights)
 		lines[#lines + 1] = string.format("errors: %d%s", errorCount,
@@ -6945,14 +6949,19 @@ do
 	end
 
 	-- A short on-screen notice (once), for things the player should know about. (hint: extra
-	-- words for the output window only)
+	-- words for the output window only; news: good news, printed rather than warned)
 	local told = {}
-	function Diagnostics.notifyOnce(key, text, hint)
+	function Diagnostics.notifyOnce(key, text, hint, news)
 		if told[key] then
 			return
 		end
 		told[key] = true
-		warn("[StencilShadows] " .. text .. (hint and (" " .. hint) or ""))
+		local line = "[StencilShadows] " .. text .. (hint and (" " .. hint) or "")
+		if news then
+			print(line)
+		else
+			warn(line)
+		end
 		-- (SetCore can refuse while the game is still starting up: tried again a few times)
 		task.spawn(function()
 			for _ = 1, 10 do
@@ -7103,6 +7112,7 @@ do
 
 	-- Returns true when every queued chunk has been gone through.
 	local function processStatic(deadline)
+		stats.areasLeft = max(0, #staticQueue - staticHead + 1)
 		while clock() < deadline do
 			local st = qpop(urgentQ)
 			if not st then
@@ -7789,18 +7799,39 @@ local function mainLoop()
 		applyRobloxShadows(true)
 		Render.setVisible(Light.valid)
 	end
+	local loadStart, doneFrames = clock(), 0
 	while alive do
 		local dt = RunService.Heartbeat:Wait()
 		if not alive then
 			break
 		end
-		local ok, err = pcall(step, dt)
+		local ok, res = pcall(step, dt)
 		if not ok then
 			errorCount += 1
-			stats.lastError = tostring(err)
+			stats.lastError = tostring(res)
 			if errorCount <= 10 then
-				warn("[StencilShadows] " .. tostring(err))
+				warn("[StencilShadows] " .. tostring(res))
 			end
+		end
+		-- loading finished: everything there is to build is built (and stays so for half a second,
+		-- so a gap between two batches doesn't count). Said once.
+		if not stats.loaded and ok and res == true and enabled and Light.valid and initialScanDone
+			and addQ.head > addQ.tail then
+			doneFrames += 1
+			if doneFrames >= 30 then
+				stats.loaded = true
+				stats.loadSeconds = clock() - loadStart
+				if CONFIG.LoadingMessage then
+					local secs = math.max(1, math.floor(stats.loadSeconds + 0.5))
+					local text = wholeMap
+						and string.format("Loading complete: the whole map's shadows are ready (%d s).", secs)
+						or string.format("Loading complete: the shadows around you are ready (%d s). This map is "
+							.. "too big to load all at once, so farther shadows load as you walk.", secs)
+					Diagnostics.notifyOnce("loaded", text, nil, true)
+				end
+			end
+		else
+			doneFrames = 0
 		end
 	end
 end

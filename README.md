@@ -112,10 +112,18 @@ There are two scripts. They are the same script with one setting changed:
     nothing.
   - Lamps (2013 edition) cast shadows only if their own `Shadows` is on, like in Roblox (it's off
     by default on new lights). A lamp with `Shadows` off still lights things up.
-- **Shadows load right away, nearest first.** There is no start-up pause and no loading screen;
-  the shadows near you appear within the first moments and the rest follow as you walk. (The
-  start-up pause and whole-map loading from earlier versions are still there as `LoadPause` and
-  `LoadWholeMap`, off: they made the game laggy.)
+- **The whole map loads, in the background.** There is no start-up pause and no loading screen:
+  the shadows near you appear within the first moments, and the rest of the map follows, nearest
+  first, a little each frame, so the game doesn't freeze. Once a map is built it's kept, so
+  nothing loads while you walk around. A map bigger than the limits (`WholeMapParts`, 12,000
+  parts with EditableMesh; `PartsWholeMapParts`, 4,000 parts without) loads around you as you
+  walk instead.
+  - When everything is built, a notice titled "Stencil Shadows" says so: "Loading complete: the
+    whole map's shadows are ready (12 s)." (On a map too big for that: "Loading complete: the
+    shadows around you are ready (5 s). This map is too big to load all at once, so farther
+    shadows load as you walk.") `LoadingMessage = false` turns it off.
+  - The start-up pause from earlier versions is still there as `LoadPause`, off: freezing the game
+    while loading made it laggy.
   - Floors made of parts with `CanQuery` off (often roads, decorations, or a visible floor over an
     invisible one) take shadows too. Roblox's spatial queries skip such parts, so the script keeps
     a grid of its own for them.
@@ -165,7 +173,8 @@ All settings are in the `CONFIG` table at the top of the script.
 | `LightPoolSize` | `0.6` | How much of a lamp's Range takes the shadow away fully. |
 | `LightFade` | `true` | A ring at half darkness around each pool of light. |
 | `LoadPause` | `false` | Freeze at the start until nearby shadows are built (off: it made joining laggy). |
-| `LoadWholeMap` | `false` | Build the whole map in that pause and keep it, unless the map is bigger than the limits below. |
+| `LoadWholeMap` | `true` | Build the whole map in the background and keep it, unless it's bigger than the limits below. |
+| `LoadingMessage` | `true` | A notice once the shadows have finished loading. |
 | `WholeMapParts` | `12000` | Most parts for a whole-map load with EditableMesh. |
 | `PartsWholeMapParts` | `4000` | The same when drawing with parts. |
 | `WholeMapPauseMax` | `20` | The longest the pause may last for a whole map, in seconds (`LoadPauseMax`, 5, otherwise). |
@@ -223,8 +232,9 @@ are drawn with `"EditableMesh"` or `"Parts"`, and `GetStats().wholeMap` whether 
    plane is worked out (a disc, cut to the cone for spot and surface lights). The pool is cut out
    of the shadow, except where a part between the lamp and the surface casts a shadow from the
    lamp (projected from the lamp's position).
-6. **Scheduling.** Still parts are bucketed into 64-stud chunks that load nearest-first and unload
-   when far away (with `LoadWholeMap` on, small maps are built in the start-up pause and kept).
+6. **Scheduling.** Still parts are bucketed into 64-stud chunks that load nearest-first, a few
+   milliseconds each frame. Maps within the whole-map limits are built completely and kept; on
+   bigger ones, chunks unload when far away.
    Moving parts and characters have their own per-frame jobs.
 
 ## Indoors: how the old stencil shadows behaved
@@ -308,7 +318,7 @@ What that means inside a building:
 The script was run unmodified in a simulated Roblox runtime: a Luau interpreter plus mocked engine
 APIs whose property and method checks follow Roblox's API dump.
 
-The 83 scenarios compare the shadow triangles it draws against independently computed projections.
+The 84 scenarios compare the shadow triangles it draws against independently computed projections.
 They cover:
 
 - Every shape, clipping, parts sunk into the floor, shadows falling 450 studs.
@@ -338,6 +348,8 @@ They cover:
   still), phones using the outlines, the nearest moving thing's shadow keeping up with it with no
   time to spare, a package whose meshes can only be traced as boxes not casting a blocky shadow,
   and hidden faces of an avatar's blocks skipped.
+- The whole map loading in the background with no pause (far islands too), the "Loading complete"
+  notice said exactly once, and a map too big for that saying so.
 - Walking around a kept map: only shadows that depend on the level of detail are rebuilt.
 - No pause by default (shadows and Roblox's shadows switched off from the first frames), Roblox's
   shadows switched back off within a second when a script sneaks them on, floors with `CanQuery`
